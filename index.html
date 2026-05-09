@@ -188,6 +188,7 @@ window.authRegister = async function() {
   try {
     const c = await createUserWithEmailAndPassword(auth, email, pass);
     await updateProfile(c.user, {displayName: name});
+    await c.user.getIdToken(true); // ← принудительно обновить токен
     await setDoc(doc(db,'users',c.user.uid), {displayName: name, email, updatedAt: serverTimestamp()}, {merge:true});
   } catch(e) { _showAuthErr(_fbErrRu(e.code)); }
   _setAuthLoad(false);
