@@ -78,9 +78,10 @@ async function _loadUD(uid) {
 }
 
 async function _saveUD(data) {
-  if (!_currentUser) return;
+  const user = _currentUser || auth.currentUser;
+  if (!user) return;
   try {
-    await setDoc(doc(db,'users',_currentUser.uid), {...data, updatedAt:serverTimestamp()}, {merge:true});
+    await setDoc(doc(db,'users',user.uid), {...data, updatedAt:serverTimestamp()}, {merge:true});
     _userData = {..._userData, ...data};
   } catch(e) { console.error('saveUD', e); }
 }
@@ -187,7 +188,7 @@ window.authRegister = async function() {
   try {
     const c = await createUserWithEmailAndPassword(auth, email, pass);
     await updateProfile(c.user, {displayName: name});
-    await _saveUD({displayName: name, email});
+    await setDoc(doc(db,'users',c.user.uid), {displayName: name, email, updatedAt: serverTimestamp()}, {merge:true});
   } catch(e) { _showAuthErr(_fbErrRu(e.code)); }
   _setAuthLoad(false);
 };
