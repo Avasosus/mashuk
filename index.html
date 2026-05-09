@@ -1,0 +1,2323 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0">
+<title>Машук 17 — Путь участника</title>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;700;900&family=Inter:wght@400;500;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+
+<!-- Firebase -->
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
+import { getFirestore, doc, getDoc, setDoc, collection, getDocs, query, orderBy, limit, serverTimestamp, deleteField } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCa8_mEHs3lZnjUb2NwyBb4kOAuLtNQhN8",
+  authDomain: "mashuk17-77c3c.firebaseapp.com",
+  projectId: "mashuk17-77c3c",
+  storageBucket: "mashuk17-77c3c.appspot.com",
+  messagingSenderId: "904674751574",
+  appId: "1:904674751574:web:51e8d1481a1284323ff7f7",
+  measurementId: "G-1ZP85TPVE2"
+};
+
+const app=initializeApp(firebaseConfig), auth=getAuth(app), db=getFirestore(app);
+
+// ══════════════════════════════════════════════════
+//  ВНУТРЕННИЕ переменные — НЕ экспортируются в window
+// ══════════════════════════════════════════════════
+let _currentUser=null, _userData={};
+
+// ── Валидация XP на клиенте перед записью ────────
+// XP за событие: min=15, max=35. Уровень перем по таблице.
+// Максимум событий ~30, итого ≤ 1050 XP.
+// Добавляем запас до 2000 для будущего контента.
+const XP_MAX = 2000;
+const XP_PER_EVENT_MAX = 35;
+const STAT_MAX = 30; // разумный максимум одного стата
+
+function _validateChar(c) {
+  if (!c || typeof c !== 'object') return false;
+  if (typeof c.xp !== 'number' || c.xp < 0 || c.xp > XP_MAX) return false;
+  if (!['participant','volunteer'].includes(c.role)) return false;
+  if (typeof c.name !== 'string' || c.name.length < 1 || c.name.length > 30) return false;
+  const validAvatars = ['🧑‍🎓','👩‍🎓','🧑‍💻','👩‍💻','🧑‍🏫','👩‍🏫','🧑‍🎨','👩‍🎨','🧑‍🚀','👩‍🚀'];
+  if (!validAvatars.includes(c.avatar)) return false;
+  if (typeof c.stats !== 'object') return false;
+  for (const k of ['leadership','creativity','communication','responsibility']) {
+    if (typeof c.stats[k] !== 'number' || c.stats[k] < 1 || c.stats[k] > STAT_MAX) return false;
+  }
+  // Уровень должен соответствовать XP
+  const XP_TABLE=[0,50,150,300,500,800];
+  let expectedLevel = 1;
+  for (let i=XP_TABLE.length-1; i>=0; i--) if (c.xp >= XP_TABLE[i]) { expectedLevel = i+1; break; }
+  if (c.level !== expectedLevel) return false;
+  return true;
+}
+
+// ── Подписка на auth state ────────────────────────
+onAuthStateChanged(auth, async u => {
+  if (u) {
+    _currentUser = u;
+    _userData = await _loadUD(u.uid);
+    _syncFB();
+    _showApp(u);
+  } else {
+    _currentUser = null;
+    _userData = {};
+    _showAuth();
+  }
+});
+
+async function _loadUD(uid) {
+  try {
+    const s = await getDoc(doc(db,'users',uid));
+    return s.exists() ? s.data() : {};
+  } catch(e) { return {}; }
+}
+
+async function _saveUD(data) {
+  if (!_currentUser) return;
+  try {
+    await setDoc(doc(db,'users',_currentUser.uid), {...data, updatedAt:serverTimestamp()}, {merge:true});
+    _userData = {..._userData, ...data};
+  } catch(e) { console.error('saveUD', e); }
+}
+
+// ── Синхронизация leaderboard ─────────────────────
+async function _syncLeaderboard(char) {
+  if (!_currentUser || !char) return;
+  if (!_validateChar(char)) {
+    console.warn('SECURITY: Invalid char data, leaderboard sync blocked');
+    return;
+  }
+  const XP_TABLE=[0,50,150,300,500,800];
+  let level = 1;
+  for (let i=XP_TABLE.length-1; i>=0; i--) if (char.xp >= XP_TABLE[i]) { level = i+1; break; }
+  try {
+    await setDoc(doc(db,'leaderboard',_currentUser.uid), {
+      name: String(char.name).slice(0,30),
+      xp: Math.max(0, Math.min(XP_MAX, Math.floor(char.xp))),
+      level,
+      role: char.role,
+      avatar: char.avatar,
+      updatedAt: serverTimestamp()
+    });
+  } catch(e) { console.error('syncLeaderboard', e); }
+}
+
+function _syncFB() {
+  if (!_userData) return;
+  if (_userData.qodStreak)    localStorage.setItem('qod_streak_v2', JSON.stringify(_userData.qodStreak));
+  if (_userData.achievements) localStorage.setItem('ach_unlocked', JSON.stringify(_userData.achievements));
+  if (_userData.rpgChar) {
+    if (localStorage.getItem('rpg_reset') !== '1') {
+      localStorage.setItem('rpg_char', JSON.stringify(_userData.rpgChar));
+    }
+  } else {
+    localStorage.removeItem('rpg_char');
+  }
+  if (_userData.fortunes) Object.entries(_userData.fortunes).forEach(([k,v])=>localStorage.setItem(k, JSON.stringify(v)));
+  if (_userData.faqBinId)  localStorage.setItem('faq_bin_id', _userData.faqBinId);
+}
+
+// ══════════════════════════════════════════════════
+//  ПУБЛИЧНОЕ API (только то что реально нужно UI)
+//  Без прямого доступа к _currentUser/_userData
+// ══════════════════════════════════════════════════
+
+// Сохранить персонажа — с ВАЛИДАЦИЕЙ
+window._fbSaveRPG = async function(char) {
+  if (!_validateChar(char)) {
+    console.warn('SECURITY: fbSaveRPG blocked — invalid char data', char);
+    return false;
+  }
+  await _saveUD({ rpgChar: char });
+  await _syncLeaderboard(char);
+  return true;
+};
+
+// Удалить персонажа
+window._fbDeleteRPG = async function() {
+  if (!_currentUser) return;
+  try {
+    await setDoc(doc(db,'users',_currentUser.uid), {rpgChar: deleteField(), updatedAt: serverTimestamp()}, {merge:true});
+    delete _userData.rpgChar;
+    localStorage.removeItem('rpg_char');
+    localStorage.setItem('rpg_reset','1');
+    // Удаляем из leaderboard
+    await setDoc(doc(db,'leaderboard',_currentUser.uid), {xp:0, name:'', level:1, role:'participant', avatar:'🧑‍🎓', updatedAt:serverTimestamp()}).catch(()=>{});
+  } catch(e) { console.error('fbDeleteRPG',e); }
+};
+
+// Сохранить streak QOD
+window._fbSaveStreak = (d) => _saveUD({qodStreak: d});
+
+// Сохранить ачивки
+window._fbSaveAch = (a) => _saveUD({achievements: a});
+
+// Сохранить предсказание
+window._fbSaveFortune = (k, d) => {
+  const f = _userData.fortunes || {};
+  f[k] = d;
+  _saveUD({fortunes: f});
+};
+
+// Получить leaderboard (читаем из коллекции leaderboard, НЕ users)
+window._fbGetLeaderboard = async function() {
+  try {
+    const q = query(collection(db,'leaderboard'), orderBy('xp','desc'), limit(20));
+    const s = await getDocs(q);
+    return s.docs
+      .map(d => { const data=d.data(); return data.name ? {...data, uid:d.id} : null; })
+      .filter(Boolean);
+  } catch(e) { console.error('leaderboard', e); return []; }
+};
+
+// Auth
+window.authRegister = async function() {
+  const name = document.getElementById('authName').value.trim();
+  const email = document.getElementById('authEmail').value.trim();
+  const pass = document.getElementById('authPass').value;
+  if (!name) return _showAuthErr('Введи имя');
+  if (!email) return _showAuthErr('Введи email');
+  if (pass.length < 6) return _showAuthErr('Пароль минимум 6 символов');
+  _setAuthLoad(true);
+  try {
+    const c = await createUserWithEmailAndPassword(auth, email, pass);
+    await updateProfile(c.user, {displayName: name});
+    await _saveUD({displayName: name, email});
+  } catch(e) { _showAuthErr(_fbErrRu(e.code)); }
+  _setAuthLoad(false);
+};
+
+window.authLogin = async function() {
+  const email = document.getElementById('authEmail').value.trim();
+  const pass = document.getElementById('authPass').value;
+  if (!email || !pass) return _showAuthErr('Введи email и пароль');
+  _setAuthLoad(true);
+  try { await signInWithEmailAndPassword(auth, email, pass); }
+  catch(e) { _showAuthErr(_fbErrRu(e.code)); }
+  _setAuthLoad(false);
+};
+
+window.authLogout = () => signOut(auth);
+
+function _fbErrRu(c) {
+  return ({'auth/email-already-in-use':'Email уже используется','auth/invalid-email':'Некорректный email',
+    'auth/weak-password':'Пароль слишком простой','auth/user-not-found':'Пользователь не найден',
+    'auth/wrong-password':'Неверный пароль','auth/invalid-credential':'Неверный email или пароль',
+    'auth/too-many-requests':'Слишком много попыток'}[c]) || 'Ошибка: '+c;
+}
+function _showAuthErr(m) { const e=document.getElementById('authError');e.textContent=m;e.style.display='block'; }
+function _setAuthLoad(on) { document.querySelectorAll('.auth-btn').forEach(b=>b.disabled=on); }
+
+window.showLoginForm = function() {
+  document.getElementById('authNameWrap').style.display='none';
+  document.getElementById('authSubmitBtn').textContent='Войти';
+  document.getElementById('authSubmitBtn').onclick=authLogin;
+  document.getElementById('authToggle').innerHTML='Нет аккаунта? <a href="#" onclick="showRegisterForm()">Зарегистрироваться</a>';
+  document.getElementById('authFormTitle').textContent='ВХОД';
+  document.getElementById('authError').style.display='none';
+};
+window.showRegisterForm = function() {
+  document.getElementById('authNameWrap').style.display='block';
+  document.getElementById('authSubmitBtn').textContent='Создать аккаунт';
+  document.getElementById('authSubmitBtn').onclick=authRegister;
+  document.getElementById('authToggle').innerHTML='Уже есть аккаунт? <a href="#" onclick="showLoginForm()">Войти</a>';
+  document.getElementById('authFormTitle').textContent='РЕГИСТРАЦИЯ';
+  document.getElementById('authError').style.display='none';
+};
+
+function _showAuth() { _hide('splash'); _show('authScreen','flex'); _hide('main'); }
+function _showApp(u) {
+  _hide('splash'); _hide('authScreen'); _show('main','block');
+  const name = u.displayName || u.email || 'Участник';
+  document.getElementById('userName').textContent = name;
+  document.getElementById('userAva').textContent = name[0].toUpperCase();
+  _show('userBar','flex');
+  navigateTo('home');
+  const heroTitle=document.querySelector('.hero-title');
+  const heroSub=document.querySelector('.hero-sub');
+  if(heroTitle) heroTitle.classList.add('hidden-on-home');
+  if(heroSub) heroSub.classList.add('hidden-on-home');
+  updateAchBadge(); updateRPGBadge();
+}
+function _show(id,d='block'){document.getElementById(id).style.display=d;}
+function _hide(id){document.getElementById(id).style.display='none';}
+
+// Safe UID accessor for client-side seeding (not sensitive — just for randomness)
+window._getUID = function() { return _currentUser ? _currentUser.uid : null; };
+</script>
+
+<style>
+:root{
+  --bg:#050508;--surface:#0d0d12;--card:#111118;--border:rgba(255,255,255,.07);
+  --orange:#ff5500;--cyan:#0deeff;--purple:#0deeff;--white:#fff;--muted:rgba(255,255,255,.38);--text:#f5f5f5;
+  /* Брендбук: ff5500 / 0deeff / 000000 / ffffff */
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
+
+body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:radial-gradient(ellipse 70% 55% at 20% 15%,rgba(255,85,0,.15) 0%,transparent 55%),
+    radial-gradient(ellipse 60% 50% at 80% 80%,rgba(13,238,255,.12) 0%,transparent 55%),
+    radial-gradient(ellipse 40% 40% at 50% 50%,rgba(255,85,0,.04) 0%,transparent 50%);
+  animation:thermalShift 12s ease-in-out infinite alternate;}
+@keyframes thermalShift{0%,100%{opacity:1;}50%{opacity:.65;}}
+
+body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.35;
+  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");}
+
+/* ── SCREENS ── */
+.screen{position:relative;z-index:1;display:none;}
+.screen.active{display:block;}
+.screen-flex{display:none;align-items:center;justify-content:center;min-height:100vh;}
+.screen-flex.active{display:flex;}
+
+/* ── APP WRAPPER ── */
+#appWrap{max-width:680px;margin:0 auto;padding:20px 16px 80px;position:relative;}
+
+/* ── SPLASH ── */
+#splash{position:fixed;inset:0;z-index:9000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;text-align:center;background:var(--bg);}
+.splash-logo-wrap{position:relative;width:90px;height:90px;display:flex;align-items:center;justify-content:center;}
+.splash-logo-wrap::before{content:'';position:absolute;inset:-12px;border-radius:50%;background:radial-gradient(circle,rgba(13,238,255,.2) 0%,transparent 70%);animation:pulse 2s ease-in-out infinite;}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:.8;}50%{transform:scale(1.15);opacity:1;}}
+.splash-title{font-family:'Unbounded',sans-serif;font-size:24px;font-weight:900;letter-spacing:-1px;color:var(--white);}
+.splash-title span{background:linear-gradient(90deg,var(--orange),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.splash-sub{color:var(--muted);font-size:12px;}
+.spin-ring{width:30px;height:30px;border-radius:50%;border:2px solid rgba(13,238,255,.2);border-top-color:var(--cyan);animation:spin .8s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+/* ── ONBOARDING ── */
+#onboarding{position:fixed;inset:0;z-index:8000;display:none;flex-direction:column;align-items:center;justify-content:center;padding:24px;background:var(--bg);}
+#onboarding.active{display:flex;}
+.ob-slides{width:100%;max-width:380px;}
+.ob-slide{display:none;text-align:center;animation:fadeUp .4s ease both;}
+.ob-slide.active{display:block;}
+.ob-pixel{margin:0 auto 20px;display:block;}
+.ob-title{font-family:'Unbounded',sans-serif;font-size:18px;font-weight:900;color:var(--white);margin-bottom:10px;line-height:1.2;}
+.ob-text{color:var(--muted);font-size:13px;line-height:1.7;margin-bottom:28px;}
+.ob-dots{display:flex;gap:8px;justify-content:center;margin-bottom:24px;}
+.ob-dot{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.15);transition:all .3s;}
+.ob-dot.active{background:var(--cyan);width:24px;border-radius:4px;}
+.ob-btn{width:100%;max-width:320px;background:linear-gradient(135deg,var(--orange),var(--cyan));color:#000;border:none;border-radius:14px;padding:14px;font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700;cursor:pointer;letter-spacing:.5px;transition:opacity .2s,transform .1s;}
+.ob-btn:active{transform:scale(.98);}
+.ob-skip{margin-top:12px;font-size:11px;color:var(--muted);cursor:pointer;text-align:center;}
+.ob-skip:hover{color:var(--text);}
+
+/* ── AUTH ── */
+#authScreen{padding:24px;background:var(--bg);}
+.auth-card{width:100%;max-width:360px;background:rgba(8,10,16,.9);border:1px solid rgba(13,238,255,.2);border-radius:24px;padding:32px 28px;display:flex;flex-direction:column;gap:16px;position:relative;overflow:hidden;backdrop-filter:blur(20px);box-shadow:0 0 40px rgba(13,238,255,.08),inset 0 0 40px rgba(0,0,0,.4);}
+.auth-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--orange),var(--cyan));}
+.auth-card::after{content:'';position:absolute;top:-60%;right:-30%;width:80%;height:80%;border-radius:50%;background:radial-gradient(circle,rgba(255,85,0,.08) 0%,rgba(13,238,255,.05) 40%,transparent 70%);pointer-events:none;}
+.auth-logo{text-align:center;position:relative;z-index:1;}
+.auth-title{font-family:'Unbounded',sans-serif;font-size:16px;font-weight:900;color:var(--white);text-align:center;position:relative;z-index:1;}
+.auth-form-title{font-family:'Unbounded',sans-serif;font-size:10px;font-weight:700;color:var(--cyan);text-align:center;letter-spacing:3px;position:relative;z-index:1;}
+.auth-field{display:flex;flex-direction:column;gap:6px;position:relative;z-index:1;}
+.auth-label{font-size:11px;color:rgba(255,255,255,.5);font-weight:600;letter-spacing:.5px;text-transform:uppercase;}
+.auth-input{width:100%;background:rgba(13,238,255,.04);border:1px solid rgba(13,238,255,.18);color:var(--text);border-radius:12px;padding:12px 16px;font-size:15px;font-family:'Inter',sans-serif;outline:none;transition:border-color .2s,background .2s;}
+.auth-input:focus{border-color:rgba(13,238,255,.5);background:rgba(13,238,255,.07);}
+.auth-input::placeholder{color:rgba(255,255,255,.2);}
+.auth-btn{width:100%;border:none;border-radius:12px;padding:14px;font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700;cursor:pointer;letter-spacing:.5px;transition:opacity .2s,transform .1s;position:relative;z-index:1;}
+.auth-btn:active{transform:scale(.98);} .auth-btn:disabled{opacity:.4;cursor:not-allowed;}
+.auth-btn-primary{background:linear-gradient(135deg,var(--orange) 0%,var(--cyan) 100%);color:#000;font-weight:900;}
+.auth-btn-primary:hover{opacity:.9;}
+.auth-divider{display:flex;align-items:center;gap:12px;color:var(--muted);font-size:11px;position:relative;z-index:1;}
+.auth-divider::before,.auth-divider::after{content:'';flex:1;height:1px;background:rgba(13,238,255,.15);}
+.auth-error{display:none;background:rgba(255,85,0,.1);border:1px solid rgba(255,85,0,.35);color:var(--orange);border-radius:10px;padding:10px 14px;font-size:12px;line-height:1.5;position:relative;z-index:1;}
+.auth-toggle{text-align:center;font-size:12px;color:var(--muted);position:relative;z-index:1;}
+.auth-toggle a{color:var(--cyan);text-decoration:none;font-weight:600;}
+
+/* ── HEADER ── */
+.header{margin-bottom:16px;animation:fadeDown .5s ease both;padding-top:4px;}
+.header-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
+.mashuk-logo{display:inline-flex;align-items:center;gap:10px;}
+.logo-svg{height:26px;width:auto;}
+.logo-sub{font-family:'Unbounded',sans-serif;font-size:9px;color:var(--muted);line-height:1.3;letter-spacing:.5px;}
+.header-badge{display:inline-flex;align-items:center;gap:6px;background:rgba(13,238,255,.1);border:1px solid rgba(13,238,255,.25);color:var(--cyan);font-family:'Unbounded',sans-serif;font-size:9px;letter-spacing:2px;padding:4px 10px;border-radius:20px;text-transform:uppercase;}
+.header-badge::before{content:'';width:5px;height:5px;border-radius:50%;background:var(--cyan);animation:blink 2s ease-in-out infinite;}
+@keyframes blink{0%,100%{opacity:1;}50%{opacity:.3;}}
+.hero-line{height:1px;background:linear-gradient(90deg,transparent,rgba(255,85,0,.5),rgba(13,238,255,.5),transparent);margin-bottom:16px;}
+.hero-title{font-family:'Unbounded',sans-serif;font-size:clamp(20px,5vw,28px);font-weight:900;letter-spacing:-1px;color:var(--white);line-height:1.15;margin-bottom:5px;}
+.hero-title.hidden-on-home{display:none;}
+.hero-title .og{color:var(--orange);}
+.hero-sub{color:var(--muted);font-size:11px;letter-spacing:.3px;}
+.hero-sub.hidden-on-home{display:none;}
+
+/* ── USER BAR ── */
+#userBar{display:none;align-items:center;gap:7px;background:rgba(13,13,18,.7);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:5px 8px 5px 6px;position:absolute;top:14px;right:16px;z-index:10;animation:fadeDown .5s ease both;backdrop-filter:blur(8px);}
+.user-ava{width:22px;height:22px;border-radius:50%;background:linear-gradient(135deg,var(--orange),var(--cyan));flex-shrink:0;display:flex;align-items:center;justify-content:center;font-family:'Unbounded',sans-serif;font-size:9px;font-weight:700;color:#000;}
+#userName{font-size:10px;font-weight:600;flex:1;opacity:.6;max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.logout-btn{font-size:9px;color:rgba(255,255,255,.3);cursor:pointer;padding:2px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.08);background:none;font-family:'Unbounded',sans-serif;font-weight:600;transition:all .2s;}
+.logout-btn:hover{color:var(--orange);border-color:rgba(255,85,0,.3);}
+
+/* ── HOME ── */
+.home-greeting{text-align:center;padding:8px 0 24px;}
+.home-g-title{font-family:'Unbounded',sans-serif;font-size:clamp(26px,7vw,38px);font-weight:900;letter-spacing:-1px;color:var(--white);line-height:1.1;margin-bottom:8px;}
+.home-g-title .og{color:var(--orange);} .home-g-title .cy{color:var(--cyan);}
+.home-g-sub{color:var(--muted);font-size:12px;letter-spacing:.3px;}
+.home-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+
+/* ── BASE TILE ── */
+.tile{
+  background:rgba(8,10,16,.75);
+  border:1px solid rgba(13,238,255,.14);
+  border-radius:20px;
+  cursor:pointer;
+  position:relative;
+  overflow:hidden;
+  transition:transform .22s cubic-bezier(.23,1,.32,1),border-color .22s,box-shadow .22s;
+  display:flex;flex-direction:column;justify-content:flex-end;
+  padding:18px 16px 16px;
+  min-height:148px;
+  animation:fadeUp .5s ease both;
+  backdrop-filter:blur(18px);
+  box-shadow:inset 0 0 28px rgba(0,0,0,.45),0 2px 8px rgba(0,0,0,.3);
+}
+.tile:hover{
+  transform:translateY(-4px) scale(1.02);
+  box-shadow:0 0 32px rgba(13,238,255,.18),inset 0 0 24px rgba(0,0,0,.3);
+  border-color:rgba(13,238,255,.4);
+}
+.tile:active{transform:scale(.97);}
+
+/* геометрический луч (брендбук) */
+.tile::before{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(120deg,transparent 42%,rgba(13,238,255,.06) 58%,transparent 72%);
+  transition:opacity .2s;
+}
+/* тепловизорное пятно */
+.tile::after{
+   content:'';
+  position:absolute;
+  inset:0;
+  border-radius:20px;
+  background:radial-gradient(
+    circle at 75% 25%,
+  rgba(255,85,0,.05),
+  rgba(13,238,255,.02),
+    transparent 65%
+  );
+
+  opacity:0;                /* ⬅️ ВАЖНО: скрываем */
+  transition:opacity .35s ease; /* ⬅️ плавность */
+  pointer-events:none;
+}
+.tile:hover::after{
+  opacity:0.6; /* ⬅️ появляется при наведении */
+}
+
+.tile-full{grid-column:1/-1;min-height:112px;}
+.tile-full .tile-emoji{top:50%;transform:translateY(-50%);right:20px;}
+
+/* ── ГЛАВНАЯ ПЛИТКА (RPG) — максимальный акцент ── */
+.t-rpg{
+  background:rgba(8,10,16,.8);
+  border-color:rgba(13,238,255,.25);
+  box-shadow:inset 0 0 40px rgba(0,0,0,.5),0 0 28px rgba(13,238,255,.08);
+}
+.t-rpg::after{
+  background:radial-gradient(circle,rgba(255,85,0,.38) 0%,rgba(13,238,255,.18) 45%,transparent 70%);
+}
+.t-rpg:hover{
+  box-shadow:0 0 40px rgba(13,238,255,.22),inset 0 0 30px rgba(0,0,0,.3);
+  border-color:rgba(13,238,255,.5);
+}
+
+/* ── ЯРКАЯ ПЛИТКА (Достижения) — оранжевый акцент ── */
+.t-achieve{
+  background:rgba(8,10,16,.75);
+  border-color:rgba(13,238,255,.16); /* как у всех */
+  box-shadow:inset 0 0 28px rgba(0,0,0,.45),0 0 14px rgba(13,238,255,.04);
+}
+.t-achieve::after{
+  content:'';
+  position:absolute;
+  inset:0;
+  border-radius:20px;
+  background:radial-gradient(
+    circle at 75% 25%,
+    rgba(255,85,0,.08),
+    rgba(13,238,255,.04),
+    transparent 65%
+  );
+
+  opacity:0; /* ⬅️ скрыто */
+  transition:opacity .35s ease, transform .35s ease;
+  transform:scale(0.95);
+  pointer-events:none;
+}
+
+.t-achieve:hover{
+  opacity:0.6;
+  transform:scale(1);
+}
+
+/* ── СПОКОЙНЫЕ ПЛИТКИ (Предсказание, FAQ) ── */
+.t-fortune{
+  background:rgba(8,10,16,.75);
+  border-color:rgba(13,238,255,.16);
+  box-shadow:inset 0 0 28px rgba(0,0,0,.45),0 0 14px rgba(13,238,255,.04);
+}
+.t-fortune::after{
+  background:radial-gradient(circle,rgba(255,85,0,.22) 0%,rgba(13,238,255,.14) 45%,transparent 70%);
+}
+.t-fortune:hover{
+  box-shadow:0 0 30px rgba(13,238,255,.16),inset 0 0 22px rgba(0,0,0,.3);
+  border-color:rgba(13,238,255,.4);
+}
+.t-faq{
+  background:rgba(8,10,16,.75);
+  border-color:rgba(13,238,255,.14);
+  box-shadow:inset 0 0 28px rgba(0,0,0,.45);
+}
+.t-faq::after{
+  background:radial-gradient(circle,rgba(255,85,0,.18) 0%,rgba(13,238,255,.10) 45%,transparent 70%);
+}
+.t-faq:hover{
+  box-shadow:0 0 28px rgba(13,238,255,.13),inset 0 0 22px rgba(0,0,0,.3);
+  border-color:rgba(13,238,255,.36);
+}
+
+/* ── EMOJI / ИКОНКА ── */
+.tile-emoji{
+  position:absolute;top:14px;right:14px;
+  font-size:38px;opacity:.95;
+  filter:drop-shadow(0 0 10px rgba(13,238,255,.5)) drop-shadow(0 0 3px rgba(255,85,0,.3));
+  transition:filter .2s,transform .2s;
+  z-index:2;
+}
+.tile:hover .tile-emoji{
+  filter:drop-shadow(0 0 16px rgba(13,238,255,.75)) drop-shadow(0 0 6px rgba(255,85,0,.4));
+  transform:scale(1.1) translateY(-2px);
+}
+.tile-full .tile-emoji{top:50%;transform:translateY(-50%);}
+.tile-full:hover .tile-emoji{transform:translateY(-52%) scale(1.1);}
+
+/* ── ТЕКСТ ПЛИТОК ── */
+.tile-label{
+  font-size:9px;font-family:'Unbounded',sans-serif;font-weight:700;
+  letter-spacing:1.5px;text-transform:uppercase;
+  margin-bottom:5px;color:var(--cyan);opacity:.75;
+  position:relative;z-index:1;
+}
+.t-achieve .tile-label{
+  color:var(--cyan);
+  opacity:.75;
+}
+.tile-title{
+  font-family:'Unbounded',sans-serif;
+  font-size:13px;font-weight:900;
+  color:var(--white);line-height:1.25;letter-spacing:-.2px;
+  position:relative;z-index:1;
+  text-shadow:0 1px 8px rgba(0,0,0,.6);
+}
+.tile-full .tile-title{font-size:14px;}
+.tile-desc{font-size:11px;color:rgba(255,255,255,.4);margin-top:4px;line-height:1.4;position:relative;z-index:1;}
+
+/* ── SECTION WRAPPER ── */
+.back-btn{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--muted);border-radius:10px;padding:7px 13px;font-size:11px;font-family:'Unbounded',sans-serif;font-weight:600;cursor:pointer;transition:all .2s;letter-spacing:.3px;margin-bottom:18px;}
+.back-btn:hover{color:var(--text);border-color:rgba(255,255,255,.2);}
+.section-page{display:none;animation:fadeUp .4s ease both;}
+.section-page.active{display:block;}
+
+/* ── FORTUNE ── */
+.fortune-hero{text-align:center;padding:6px 0 18px;}
+.fortune-title{font-family:'Unbounded',sans-serif;font-size:16px;font-weight:900;color:var(--white);margin-bottom:5px;}
+.fortune-sub{color:var(--muted);font-size:12px;}
+.cookie-wrap{display:flex;justify-content:center;padding:14px 0;}
+.cookie-btn{background:none;border:none;cursor:pointer;transition:transform .2s,filter .2s;padding:0;}
+.cookie-btn:hover:not(.cracked){transform:scale(1.07);filter:drop-shadow(0 0 20px rgba(13,238,255,.4));}
+.cookie-btn.cracked{cursor:default;}
+.cookie-svg{width:110px;height:110px;display:block;}
+.fortune-hint{text-align:center;color:var(--muted);font-size:13px;padding:6px 0;}
+.fortune-already{display:none;text-align:center;color:var(--muted);font-size:13px;padding:10px 0;line-height:1.6;}
+.fortune-already.show{display:block;}
+.fortune-scroll{display:none;background:var(--card);border:1px solid var(--border);border-radius:20px;padding:22px 18px;margin-top:14px;animation:fadeUp .5s ease both;}
+.fortune-scroll.show{display:block;}
+.fortune-date{font-family:'Unbounded',sans-serif;font-size:9px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:12px;}
+.fortune-text{font-size:15px;line-height:1.8;color:var(--text);}
+.fortune-text em{color:var(--cyan);font-style:normal;font-weight:600;}
+.fortune-divider{height:1px;background:var(--border);margin:16px 0;}
+.fortune-lucky{display:flex;gap:8px;flex-wrap:wrap;}
+.lucky-item{background:rgba(13,238,255,.07);border:1px solid rgba(13,238,255,.18);color:var(--cyan);border-radius:20px;padding:4px 12px;font-size:11px;font-family:'Unbounded',sans-serif;font-weight:600;}
+
+/* ── CHALLENGE ── */
+.challenge-hero{text-align:center;padding:6px 0 18px;}
+.challenge-title{font-family:'Unbounded',sans-serif;font-size:16px;font-weight:900;color:var(--white);margin-bottom:5px;}
+.challenge-sub{color:var(--muted);font-size:12px;}
+.streak-card{display:flex;align-items:center;gap:12px;background:var(--card);border:1px solid var(--border);border-radius:14px;padding:12px 14px;margin-bottom:14px;}
+.streak-icon{font-size:22px;}
+.streak-info{flex:1;}
+.streak-label{font-size:10px;color:var(--muted);font-family:'Unbounded',sans-serif;letter-spacing:.5px;text-transform:uppercase;}
+.streak-val{font-family:'Unbounded',sans-serif;font-size:18px;font-weight:900;color:var(--orange);margin-top:2px;}
+.streak-sub-text{font-size:10px;color:var(--muted);}
+.streak-badge-chip{font-size:10px;font-family:'Unbounded',sans-serif;font-weight:700;background:rgba(255,85,0,.1);border:1px solid rgba(255,85,0,.25);color:var(--orange);border-radius:20px;padding:4px 10px;}
+.qod-loading{display:flex;flex-direction:column;align-items:center;gap:12px;padding:40px 20px;background:var(--card);border:1px solid var(--border);border-radius:20px;margin-bottom:14px;}
+.qod-loading-txt{font-size:12px;color:var(--muted);font-family:'Unbounded',sans-serif;letter-spacing:.5px;}
+.qod-empty{text-align:center;padding:38px 20px;background:var(--card);border:1px solid var(--border);border-radius:20px;margin-bottom:14px;}
+.empty-icon{font-size:36px;margin-bottom:10px;}
+.empty-txt{font-size:13px;color:var(--muted);line-height:1.6;}
+.challenge-card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:18px;margin-bottom:14px;}
+.ch-day{font-size:10px;color:var(--muted);font-family:'Unbounded',sans-serif;letter-spacing:1px;margin-bottom:10px;}
+.qod-cat{display:inline-block;background:rgba(13,238,255,.08);border:1px solid rgba(13,238,255,.2);color:var(--cyan);border-radius:20px;padding:3px 12px;font-size:9px;font-family:'Unbounded',sans-serif;letter-spacing:1px;text-transform:uppercase;margin-bottom:14px;}
+.ch-text{font-size:15px;font-weight:600;color:var(--white);line-height:1.55;}
+.qod-options{display:flex;flex-direction:column;gap:9px;margin-top:14px;}
+.qod-opt{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 14px;font-size:13px;color:var(--text);cursor:pointer;text-align:left;transition:all .2s;display:flex;align-items:center;gap:11px;font-family:'Inter',sans-serif;font-weight:500;}
+.qod-opt:hover:not(:disabled){border-color:rgba(13,238,255,.35);background:rgba(13,238,255,.05);transform:translateX(3px);}
+.qod-opt:disabled{cursor:default;}
+.qod-letter{width:24px;height:24px;border-radius:50%;flex-shrink:0;background:rgba(255,255,255,.06);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-family:'Unbounded',sans-serif;font-size:9px;font-weight:700;color:var(--muted);transition:all .2s;}
+.qod-opt.correct{border-color:rgba(13,238,255,.5);background:rgba(13,238,255,.07);}
+.qod-opt.correct .qod-letter{background:var(--cyan);border-color:var(--cyan);color:#000;}
+.qod-opt.wrong{border-color:rgba(255,85,0,.4);background:rgba(255,85,0,.05);opacity:.7;}
+.qod-opt.wrong .qod-letter{background:var(--orange);border-color:var(--orange);color:#fff;}
+.qod-opt.other-correct{border-color:rgba(13,238,255,.3);background:rgba(13,238,255,.03);}
+.qod-opt.other-correct .qod-letter{background:rgba(13,238,255,.2);border-color:var(--cyan);color:var(--cyan);}
+.qod-result{margin-top:18px;border-top:1px solid var(--border);padding-top:16px;animation:fadeUp .4s ease both;}
+.qod-result-icon{font-size:34px;text-align:center;margin-bottom:7px;}
+.qod-result-title{font-family:'Unbounded',sans-serif;font-size:12px;font-weight:900;text-align:center;margin-bottom:10px;}
+.qod-result-title.correct{color:var(--cyan);} .qod-result-title.wrong{color:var(--orange);}
+.qod-explanation{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:12px;padding:12px 14px;font-size:13px;color:var(--muted);line-height:1.7;}
+.qod-explanation em{color:var(--text);font-style:normal;font-weight:600;}
+
+/* ── ACHIEVEMENTS ── */
+.achieve-hero{text-align:center;padding:6px 0 20px;}
+.achieve-hero-title{font-family:'Unbounded',sans-serif;font-size:14px;font-weight:900;color:var(--white);margin-bottom:4px;}
+.achieve-hero-sub{color:var(--muted);font-size:12px;}
+.achieve-summary{display:flex;gap:8px;margin-bottom:16px;}
+.ach-chip{flex:1;background:var(--card);border:1px solid var(--border);border-radius:14px;padding:12px;text-align:center;}
+.ach-chip-val{font-family:'Unbounded',sans-serif;font-size:20px;font-weight:900;color:var(--white);}
+.ach-chip-val.gold{color:#f59e0b;}
+.ach-chip-label{font-size:10px;color:var(--muted);margin-top:3px;}
+.ach-section{font-family:'Unbounded',sans-serif;font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;margin:16px 0 8px;}
+.ach-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;}
+.ach-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:13px 9px;text-align:center;position:relative;overflow:hidden;transition:transform .18s,border-color .2s;}
+.ach-card.unlocked{border-color:rgba(245,158,11,.35);background:linear-gradient(135deg,rgba(245,158,11,.06),var(--card));}
+.ach-card.unlocked::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#f59e0b,#ff8800);}
+.ach-card:hover{transform:translateY(-2px);}
+.ach-icon{font-size:28px;margin-bottom:6px;display:block;transition:filter .2s;}
+.ach-card.locked .ach-icon{filter:grayscale(1);opacity:.2;}
+.ach-name{font-family:'Unbounded',sans-serif;font-size:8px;font-weight:700;color:var(--text);letter-spacing:.3px;line-height:1.3;}
+.ach-card.locked .ach-name{color:rgba(255,255,255,.3);}
+.ach-new{position:absolute;top:6px;right:6px;background:var(--orange);color:#fff;font-size:7px;font-family:'Unbounded',sans-serif;font-weight:700;border-radius:5px;padding:2px 4px;animation:blink 1.5s ease-in-out infinite;}
+
+/* ── RPG ── */
+.rpg-hero{text-align:center;padding:6px 0 18px;}
+.rpg-hero-icon{font-size:44px;margin-bottom:8px;}
+.rpg-hero-title{font-family:'Unbounded',sans-serif;font-size:17px;font-weight:900;color:var(--white);margin-bottom:5px;}
+.rpg-hero-sub{color:var(--muted);font-size:12px;}
+
+/* Onboarding mini */
+.rpg-create-card{background:var(--card);border:1px solid rgba(255,85,0,.25);border-radius:20px;padding:20px;position:relative;overflow:hidden;}
+.rpg-create-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--orange),var(--cyan));}
+.rpg-field{margin-bottom:16px;}
+.rpg-label{font-size:11px;color:var(--muted);font-weight:600;letter-spacing:.5px;text-transform:uppercase;margin-bottom:7px;}
+.rpg-input{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:12px;padding:12px 16px;font-size:15px;font-family:'Inter',sans-serif;outline:none;transition:border-color .2s;}
+.rpg-input:focus{border-color:rgba(255,85,0,.5);}
+.rpg-input::placeholder{color:rgba(255,255,255,.2);}
+.role-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.role-btn{background:var(--surface);border:2px solid var(--border);border-radius:14px;padding:14px 10px;text-align:center;cursor:pointer;transition:all .2s;}
+.role-btn:hover{border-color:rgba(255,85,0,.4);}
+.role-btn.active{border-color:var(--orange);background:rgba(255,85,0,.08);}
+.role-pixel{display:block;margin:0 auto 8px;}
+.role-emoji{font-size:38px;display:block;margin:0 auto 8px;line-height:1;}
+.role-name{font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700;color:var(--white);margin-bottom:3px;}
+.role-bonus{font-size:10px;color:var(--cyan);}
+.pts-left{font-size:12px;color:var(--cyan);font-weight:600;margin-bottom:10px;}
+
+/* Avatar picker */
+.avatar-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:4px;}
+.avatar-opt{width:100%;aspect-ratio:1;border-radius:12px;border:2px solid var(--border);background:var(--surface);display:flex;align-items:center;justify-content:center;font-size:28px;cursor:pointer;transition:all .2s;line-height:1;}
+.avatar-opt:hover{border-color:rgba(255,85,0,.4);transform:scale(1.08);}
+.avatar-opt.chosen{border-color:var(--orange);background:rgba(255,85,0,.1);box-shadow:0 0 0 2px rgba(255,85,0,.2);}
+.stat-rows{display:flex;flex-direction:column;gap:9px;}
+.stat-row{display:flex;align-items:center;justify-content:space-between;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:10px 12px;}
+.stat-left{display:flex;align-items:center;gap:8px;}
+.stat-icon{font-size:17px;}
+.stat-name{font-size:13px;font-weight:500;}
+.stat-ctrl{display:flex;align-items:center;gap:10px;}
+.stat-btn{width:28px;height:28px;border-radius:8px;border:1px solid var(--border);background:rgba(255,255,255,.05);color:var(--text);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s;line-height:1;}
+.stat-btn:hover{background:rgba(255,85,0,.15);border-color:rgba(255,85,0,.4);}
+.stat-val{font-family:'Unbounded',sans-serif;font-size:16px;font-weight:900;color:var(--white);min-width:22px;text-align:center;}
+
+/* Char card */
+.char-card{background:var(--card);border:1px solid rgba(255,85,0,.3);border-radius:20px;padding:16px;margin-bottom:14px;position:relative;overflow:hidden;}
+.char-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--orange),var(--cyan));}
+.char-top{display:flex;align-items:center;gap:12px;margin-bottom:12px;}
+.char-avatar-wrap{position:relative;flex-shrink:0;}
+.char-level-badge{position:absolute;bottom:-4px;right:-4px;background:var(--orange);color:#fff;font-family:'Unbounded',sans-serif;font-size:8px;font-weight:700;border-radius:6px;padding:2px 5px;border:1px solid var(--card);}
+.char-info{flex:1;}
+.char-name{font-family:'Unbounded',sans-serif;font-size:14px;font-weight:900;color:var(--white);}
+.char-role{font-size:11px;color:var(--cyan);margin-top:2px;font-weight:600;}
+.char-title{font-size:10px;color:var(--muted);margin-top:2px;font-family:'Share Tech Mono',monospace;}
+.share-btn{font-size:10px;color:var(--cyan);cursor:pointer;padding:5px 10px;border-radius:8px;border:1px solid rgba(13,238,255,.3);background:rgba(13,238,255,.06);font-family:'Unbounded',sans-serif;font-weight:600;white-space:nowrap;flex-shrink:0;}
+.xp-bar-wrap{margin-bottom:12px;}
+.xp-bar{height:5px;background:rgba(255,255,255,.07);border-radius:3px;overflow:hidden;margin-bottom:4px;}
+.xp-fill{height:100%;background:linear-gradient(90deg,var(--orange),var(--cyan));border-radius:3px;transition:width .6s ease;}
+.xp-label{font-size:10px;color:var(--muted);font-family:'Share Tech Mono',monospace;}
+.char-stats{display:flex;gap:7px;flex-wrap:wrap;}
+.char-stat-chip{background:rgba(255,255,255,.05);border:1px solid var(--border);border-radius:9px;padding:5px 9px;font-size:12px;display:flex;gap:4px;align-items:center;}
+.char-stat-chip span:last-child{font-family:'Unbounded',sans-serif;font-weight:700;color:var(--white);}
+
+/* Event card */
+.event-card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:18px;margin-bottom:14px;animation:fadeUp .4s ease both;position:relative;overflow:hidden;}
+.event-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--orange),var(--cyan));}
+.event-pixel-wrap{display:flex;justify-content:center;margin-bottom:16px;font-size:52px;line-height:1;}
+.event-type{font-family:'Unbounded',sans-serif;font-size:9px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--orange);margin-bottom:5px;}
+.event-day{font-size:10px;color:var(--muted);margin-bottom:12px;font-family:'Share Tech Mono',monospace;}
+.event-text{font-size:14px;line-height:1.75;color:var(--text);font-weight:500;margin-bottom:16px;}
+.choices{display:flex;flex-direction:column;gap:9px;}
+.choice-btn{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 14px;font-size:13px;color:var(--text);cursor:pointer;text-align:left;transition:all .2s;font-family:'Inter',sans-serif;line-height:1.45;display:flex;align-items:flex-start;gap:10px;}
+.choice-btn:hover:not(:disabled){border-color:rgba(255,85,0,.4);background:rgba(255,85,0,.06);transform:translateX(3px);}
+.choice-btn:disabled{cursor:default;}
+.choice-btn.selected{border-color:rgba(255,85,0,.6);background:rgba(255,85,0,.1);}
+.choice-letter{display:inline-flex;width:22px;height:22px;min-width:22px;border-radius:50%;background:rgba(255,85,0,.12);border:1px solid rgba(255,85,0,.3);align-items:center;justify-content:center;font-family:'Unbounded',sans-serif;font-size:9px;font-weight:700;color:var(--orange);margin-top:1px;}
+.choice-result{margin-top:8px;padding:10px 12px;background:rgba(13,238,255,.06);border:1px solid rgba(13,238,255,.2);border-radius:10px;font-size:12px;color:var(--cyan);line-height:1.5;animation:fadeUp .3s ease both;}
+.event-done{background:var(--card);border:1px solid rgba(13,238,255,.2);border-radius:20px;padding:26px 18px;text-align:center;margin-bottom:14px;}
+.done-icon{font-size:38px;margin-bottom:9px;}
+.done-title{font-family:'Unbounded',sans-serif;font-size:13px;font-weight:900;color:var(--white);margin-bottom:8px;}
+.done-result{font-size:13px;color:var(--cyan);line-height:1.6;margin-bottom:9px;padding:10px;background:rgba(13,238,255,.05);border-radius:11px;}
+.done-next{font-size:11px;color:var(--muted);}
+.event-loading{display:none;flex-direction:column;align-items:center;gap:12px;padding:36px 18px;background:var(--card);border:1px solid var(--border);border-radius:20px;margin-bottom:14px;}
+.event-loading.show{display:flex;}
+.event-loading-txt{font-size:12px;color:var(--muted);font-family:'Unbounded',sans-serif;letter-spacing:.5px;}
+
+/* Leaderboard */
+.section-title{font-family:'Unbounded',sans-serif;font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;margin:18px 0 10px;}
+.lb-rows{display:flex;flex-direction:column;gap:8px;}
+.lb-row{display:flex;align-items:center;gap:11px;background:var(--card);border:1px solid var(--border);border-radius:14px;padding:10px 13px;transition:border-color .2s;}
+.lb-row.me{border-color:rgba(255,85,0,.4);background:rgba(255,85,0,.04);}
+.lb-rank{font-family:'Unbounded',sans-serif;font-size:13px;font-weight:900;color:var(--muted);min-width:26px;text-align:center;}
+.lb-rank.gold{color:#FFD700;} .lb-rank.silver{color:#C0C0C0;} .lb-rank.bronze{color:#CD7F32;}
+.lb-ava{width:32px;height:32px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0;}
+.lb-info{flex:1;}
+.lb-name{font-size:13px;font-weight:600;color:var(--white);}
+.lb-role{font-size:10px;color:var(--muted);}
+.lb-xp{font-family:'Unbounded',sans-serif;font-size:12px;font-weight:900;color:var(--cyan);}
+
+/* Share modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:3000;display:none;align-items:center;justify-content:center;padding:20px;}
+.modal-overlay.show{display:flex;}
+.modal-box{background:var(--card);border:1px solid var(--border);border-radius:24px;padding:26px 22px;max-width:340px;width:100%;text-align:center;}
+.modal-title{font-family:'Unbounded',sans-serif;font-size:13px;font-weight:900;color:var(--white);margin-bottom:16px;}
+.share-preview{background:linear-gradient(135deg,#0a0a0f,#0d0d14);border:1px solid rgba(255,85,0,.3);border-radius:18px;padding:20px;margin-bottom:16px;position:relative;overflow:hidden;}
+.share-preview::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--orange),var(--cyan));}
+.share-header-txt{font-family:'Unbounded',sans-serif;font-size:8px;color:var(--orange);letter-spacing:2px;margin-bottom:12px;}
+.share-stats-row{display:flex;gap:6px;justify-content:center;flex-wrap:wrap;margin:12px 0;}
+.share-stat-pill{background:rgba(255,85,0,.15);border:1px solid rgba(255,85,0,.3);border-radius:8px;padding:4px 9px;font-size:11px;color:var(--orange);}
+
+/* ADMIN */
+.modal-sheet{background:var(--card);border:1px solid var(--border);border-radius:24px 24px 16px 16px;padding:22px 18px;width:100%;max-width:480px;max-height:90vh;overflow-y:auto;}
+.modal-label{font-size:11px;color:var(--muted);font-weight:600;letter-spacing:.5px;text-transform:uppercase;margin-bottom:5px;display:block;}
+.modal-input{width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:10px 13px;font-size:13px;font-family:'Inter',sans-serif;outline:none;margin-bottom:10px;}
+.modal-input:focus{border-color:rgba(13,238,255,.4);}
+.correct-btns{display:flex;gap:7px;}
+.correct-btn{flex:1;background:var(--surface);border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:8px 4px;font-size:12px;cursor:pointer;transition:all .2s;}
+
+/* BUTTONS */
+.btn-primary{
+  width:100%;
+  background:linear-gradient(135deg,var(--orange) 0%,var(--cyan) 100%);
+  border:none;
+  color:#000;
+  border-radius:12px;
+  padding:14px;
+  font-family:'Unbounded',sans-serif;
+  font-size:11px;
+  font-weight:900;
+  cursor:pointer;
+  letter-spacing:.5px;
+  transition:all .25s ease;
+  position:relative;
+  overflow:hidden;
+}
+.btn-primary::after{content:'';position:absolute;inset:0;background:linear-gradient(135deg,transparent 40%,rgba(255,255,255,.08));pointer-events:none;}
+.btn-primary:hover{opacity:.9;} .btn-primary:active{transform:scale(.98);} .btn-primary:disabled{opacity:.35;cursor:not-allowed;}
+.btn-ghost{background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:6px 12px;font-size:11px;font-family:'Unbounded',sans-serif;font-weight:600;cursor:pointer;transition:all .2s;letter-spacing:.3px;}
+.btn-ghost:hover{color:var(--cyan);border-color:rgba(13,238,255,.3);}
+
+/* TOAST */
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--card);border:1px solid var(--border);border-radius:14px;padding:11px 18px;font-size:13px;font-weight:600;color:var(--text);opacity:0;transition:opacity .3s,transform .3s;pointer-events:none;z-index:9999;white-space:nowrap;}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+.toast.success{border-color:rgba(13,238,255,.4);color:var(--cyan);}
+.toast.error{border-color:rgba(255,85,0,.4);color:var(--orange);}
+
+/* ANIMATIONS */
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:translateY(0);}}
+@keyframes fadeDown{from{opacity:0;transform:translateY(-10px);}to{opacity:1;transform:translateY(0);}}
+@keyframes glitch{0%,100%{clip-path:inset(0 0 98% 0);}10%{clip-path:inset(10% 0 60% 0);}30%{clip-path:inset(40% 0 20% 0);}50%{clip-path:inset(70% 0 5% 0);}70%{clip-path:inset(20% 0 50% 0);}90%{clip-path:inset(80% 0 0 0);}}
+
+/* FAQ section */
+.faq-hero{text-align:center;padding:6px 0 18px;}
+.faq-hero-title{font-family:'Unbounded',sans-serif;font-size:16px;font-weight:900;color:var(--white);margin-bottom:5px;}
+.faq-hero-sub{color:var(--muted);font-size:12px;}
+.faq-empty{text-align:center;padding:40px 20px;color:var(--muted);font-size:13px;line-height:1.7;}
+.faq-list{display:flex;flex-direction:column;gap:10px;}
+.faq-item{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden;transition:border-color .2s;}
+.faq-item:hover{border-color:rgba(13,238,255,.25);}
+.faq-q{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;cursor:pointer;gap:12px;}
+.faq-q-text{font-family:'Unbounded',sans-serif;font-size:12px;font-weight:700;color:var(--white);line-height:1.35;flex:1;}
+.faq-chevron{color:var(--cyan);font-size:20px;transition:transform .25s;flex-shrink:0;line-height:1;}
+.faq-item.open .faq-chevron{transform:rotate(90deg);}
+.faq-a{max-height:0;overflow:hidden;transition:max-height .5s ease;}
+.faq-item.open .faq-a{max-height:none;}
+.faq-a-inner{padding:12px 16px 14px;font-size:13px;color:var(--muted);line-height:1.65;border-top:1px solid var(--border);}
+.faq-admin-row{display:flex;align-items:flex-start;gap:10px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 12px;}
+.faq-category{display:flex;align-items:center;gap:10px;margin:18px 0 10px;padding:0 2px;}
+.faq-category-label{font-family:'Unbounded',sans-serif;font-size:11px;font-weight:900;letter-spacing:.08em;text-transform:uppercase;white-space:nowrap;}
+.faq-category--participant .faq-category-label{color:var(--cyan);}
+.faq-category--volunteer .faq-category-label{color:var(--orange);}
+.faq-category-line{flex:1;height:1px;background:var(--border);}
+.faq-category--participant .faq-category-line{background:rgba(13,238,255,.2);}
+.faq-category--volunteer .faq-category-line{background:rgba(255,140,0,.2);}
+
+/* PIXEL ART via SVG — helpers */
+svg.pixel{image-rendering:pixelated;}
+</style>
+</head>
+<body>
+
+<!-- SPLASH -->
+<div id="splash">
+  <div class="splash-logo-wrap">
+    <svg viewBox="0 0 372 201" style="height:54px;width:auto;" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+      <defs>
+        <linearGradient id="sg1" x1="0" y1="100" x2="372" y2="100" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#0deeff" stop-opacity="0"/><stop offset=".39" stop-color="#0deeff" stop-opacity=".43"/><stop offset="1" stop-color="#0deeff"/>
+        </linearGradient>
+        <linearGradient id="sg2" x1="201" y1="100" x2="372" y2="100" xlink:href="#sg1"/>
+      </defs>
+      <path fill="url(#sg1)" d="M1.68,2.19l363.9,98.35L1.68,198.89V2.19M0,0v201.08l372-100.54L0,0h0Z"/>
+      <path fill="url(#sg2)" d="M202.76,2.93l165.94,97.61-165.94,97.61V2.93M201.08,0v201.08l170.92-100.54L201.08,0h0Z"/>
+      <path fill="#0deeff" d="M201.08,0v201.08h-40.22v-100.54l-60.32,60.32-60.32-60.32v100.54H0V0h40.22c20.11,33.51,40.22,67.03,60.32,100.54C120.65,67.03,140.76,33.51,160.86,0h40.22Z"/>
+    </svg>
+  </div>
+  <div class="splash-title">МАШУК<br><span>17</span></div>
+  <div class="splash-sub">Загрузка...</div>
+  <div class="spin-ring"></div>
+</div>
+
+<!-- ONBOARDING -->
+<div id="onboarding">
+  <div class="ob-slides">
+    <div class="ob-slide active" id="ob0">
+      <div class="ob-pixel" style="font-size:72px;line-height:1;text-align:center;display:block;margin:0 auto 20px;filter:drop-shadow(0 0 16px rgba(255,85,0,.5));">⚔️</div>
+      <div class="ob-title">Добро пожаловать в<br>Путь участника</div>
+      <div class="ob-text">Это текстовая RPG-игра, встроенная в приложение форума Машук. Создай персонажа и проходи ежедневные испытания!</div>
+    </div>
+    <div class="ob-slide" id="ob1">
+      <div class="ob-pixel" style="font-size:72px;line-height:1;text-align:center;display:block;margin:0 auto 20px;filter:drop-shadow(0 0 16px rgba(13,238,255,.5));">🎲</div>
+      <div class="ob-title">Ежедневные события</div>
+      <div class="ob-text">Каждый день тебя ждёт новая ситуация из жизни форума. Командная работа, конфликты, питч-сессии — выбирай как действовать!</div>
+    </div>
+    <div class="ob-slide" id="ob2">
+      <div class="ob-pixel" style="font-size:72px;line-height:1;text-align:center;display:block;margin:0 auto 20px;filter:drop-shadow(0 0 16px rgba(255,85,0,.4));">📈</div>
+      <div class="ob-title">Прокачивай навыки</div>
+      <div class="ob-text">Каждый выбор прокачивает Лидерство, Креативность, Коммуникацию или Ответственность. Возвращайся каждый день — расти вместе с форумом!</div>
+    </div>
+  </div>
+  <div class="ob-dots">
+    <div class="ob-dot active" id="obDot0"></div>
+    <div class="ob-dot" id="obDot1"></div>
+    <div class="ob-dot" id="obDot2"></div>
+  </div>
+  <button class="ob-btn" id="obBtn" onclick="obNext()">Далее →</button>
+  <div class="ob-skip" onclick="obSkip()">Пропустить</div>
+</div>
+
+<!-- AUTH -->
+<div id="authScreen" class="screen-flex">
+  <div class="auth-card">
+    <div class="auth-logo">
+      <svg viewBox="0 0 372 201" style="height:30px;width:auto;" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+        <defs><linearGradient id="ag1" x1="0" y1="100" x2="372" y2="100" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#0deeff" stop-opacity="0"/><stop offset=".39" stop-color="#0deeff" stop-opacity=".43"/><stop offset="1" stop-color="#0deeff"/></linearGradient><linearGradient id="ag2" x1="201" y1="100" x2="372" y2="100" xlink:href="#ag1"/></defs>
+        <path fill="url(#ag1)" d="M1.68,2.19l363.9,98.35L1.68,198.89V2.19M0,0v201.08l372-100.54L0,0h0Z"/>
+        <path fill="url(#ag2)" d="M202.76,2.93l165.94,97.61-165.94,97.61V2.93M201.08,0v201.08l170.92-100.54L201.08,0h0Z"/>
+        <path fill="#0deeff" d="M201.08,0v201.08h-40.22v-100.54l-60.32,60.32-60.32-60.32v100.54H0V0h40.22c20.11,33.51,40.22,67.03,60.32,100.54C120.65,67.03,140.76,33.51,160.86,0h40.22Z"/>
+      </svg>
+    </div>
+    <div class="auth-title">МАШУК 17</div>
+    <div class="auth-form-title" id="authFormTitle">РЕГИСТРАЦИЯ</div>
+    <div class="auth-field" id="authNameWrap">
+      <div class="auth-label">Имя</div>
+      <input class="auth-input" id="authName" type="text" placeholder="Как тебя зовут?">
+    </div>
+    <div class="auth-field">
+      <div class="auth-label">Email</div>
+      <input class="auth-input" id="authEmail" type="email" placeholder="your@email.com">
+    </div>
+    <div class="auth-field">
+      <div class="auth-label">Пароль</div>
+      <input class="auth-input" id="authPass" type="password" placeholder="Минимум 6 символов">
+    </div>
+    <div class="auth-error" id="authError"></div>
+    <button class="auth-btn auth-btn-primary" id="authSubmitBtn" onclick="authRegister()">Создать аккаунт</button>
+    <div class="auth-toggle" id="authToggle">Уже есть аккаунт? <a href="#" onclick="showLoginForm()">Войти</a></div>
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="main" style="display:none;">
+<div id="appWrap">
+
+  <!-- HEADER -->
+  <div class="header">
+    <div class="header-top">
+      <div class="mashuk-logo">
+        <svg class="logo-svg" viewBox="0 0 372 201" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+          <defs><linearGradient id="lr1" x1="0" y1="100" x2="372" y2="100" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#0deeff" stop-opacity="0"/><stop offset=".39" stop-color="#0deeff" stop-opacity=".43"/><stop offset="1" stop-color="#0deeff"/></linearGradient><linearGradient id="lr2" x1="201" y1="100" x2="372" y2="100" xlink:href="#lr1"/></defs>
+          <path fill="url(#lr1)" d="M1.68,2.19l363.9,98.35L1.68,198.89V2.19M0,0v201.08l372-100.54L0,0h0Z"/>
+          <path fill="url(#lr2)" d="M202.76,2.93l165.94,97.61-165.94,97.61V2.93M201.08,0v201.08l170.92-100.54L201.08,0h0Z"/>
+          <path fill="#0deeff" d="M201.08,0v201.08h-40.22v-100.54l-60.32,60.32-60.32-60.32v100.54H0V0h40.22c20.11,33.51,40.22,67.03,60.32,100.54C120.65,67.03,140.76,33.51,160.86,0h40.22Z"/>
+        </svg>
+        <div class="logo-sub">проект от<br>росмолодёжь</div>
+      </div>
+      <div class="header-badge">Машук 17</div>
+    </div>
+    <div class="hero-line"></div>
+    <div class="hero-title">Машук<br><span class="og">17</span></div>
+    <div class="hero-sub">Вопрос дня · Предсказания · RPG</div>
+  </div>
+
+  <!-- USER BAR -->
+  <div id="userBar">
+    <div class="user-ava" id="userAva">?</div>
+    <div id="userName">—</div>
+    <button class="logout-btn" onclick="authLogout()">Выйти</button>
+  </div>
+
+  <!-- HOME -->
+  <div id="pageHome" class="section-page active">
+    <div class="home-greeting">
+      <div class="home-g-title">МАШУК<br><span class="og">17</span></div>
+      <div class="home-g-sub">Выбери раздел</div>
+    </div>
+    <div class="home-grid">
+      <div class="tile t-fortune" onclick="navigateTo('fortune')">
+        <div class="tile-emoji">🥠</div>
+        <div class="tile-label">Каждый день</div>
+        <div class="tile-title">Предска-<br>зание</div>
+      </div>
+      <div class="tile t-achieve" onclick="navigateTo('achieve')">
+        <div class="tile-emoji">🏅</div>
+        <div class="tile-label">Твои награды</div>
+        <div class="tile-title">Дости-<br>жения</div>
+      </div>
+      <div class="tile t-rpg tile-full" onclick="navigateTo('rpg')">
+        <div class="tile-emoji">⚔️</div>
+        <div class="tile-label">Текстовая RPG</div>
+        <div class="tile-title">Путь участника</div>
+        <div class="tile-desc" id="rpgBadge">Создай персонажа и прокачивай навыки</div>
+      </div>
+      <div class="tile t-faq tile-full" onclick="navigateTo('faq')">
+        <div class="tile-emoji">💬</div>
+        <div class="tile-label">Вопросы и ответы</div>
+        <div class="tile-title">FAQ</div>
+        <div class="tile-desc">Ответы на часто задаваемые вопросы</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SECTIONS with back button -->
+  <div id="sectionWrap" style="display:none;">
+    <button class="back-btn" onclick="navigateTo('home')">‹ Назад</button>
+
+    <!-- FORTUNE -->
+    <div class="section-page" id="pageFortune">
+      <div class="fortune-hero">
+        <div class="fortune-title">Предсказание дня</div>
+        <div class="fortune-sub">Одно предсказание в день — специально для тебя</div>
+      </div>
+      <div class="cookie-wrap">
+        <button class="cookie-btn" id="cookieBtn" onclick="crackCookie()">
+          <svg class="cookie-svg" viewBox="0 0 410 410" fill="none" id="cookieSvg">
+            <g id="cookieWhole">
+              <path d="M205 30 C205 30 240 100 240 205 C240 310 205 380 205 380 C205 380 170 310 170 205 C170 100 205 30 205 30Z" fill="#ff5500"/>
+              <path d="M30 205 C30 205 100 170 205 170 C310 170 380 205 380 205 C380 205 310 240 205 240 C100 240 30 205 30 205Z" fill="#ff5500"/>
+              <rect x="155" y="15" width="100" height="110" rx="32" fill="#0deeff"/>
+              <rect x="155" y="285" width="100" height="110" rx="32" fill="#0deeff"/>
+              <rect x="15" y="155" width="110" height="100" rx="32" fill="#0deeff"/>
+              <rect x="285" y="155" width="110" height="100" rx="32" fill="#0deeff"/>
+              <rect x="178" y="178" width="54" height="54" rx="8" fill="#000"/>
+            </g>
+          </svg>
+        </button>
+      </div>
+      <div class="fortune-hint" id="fortuneHint">👆 Нажми, чтобы узнать своё предсказание</div>
+      <div class="fortune-already" id="fortuneAlready">🌙 Ты уже получил предсказание сегодня.<br>Возвращайся завтра за новым!</div>
+      <div class="fortune-scroll" id="fortuneScroll">
+        <div class="fortune-date" id="fortuneDateLabel"></div>
+        <div class="fortune-text" id="fortuneTextEl"></div>
+        <div class="fortune-divider"></div>
+        <div class="fortune-lucky" id="fortuneLucky"></div>
+      </div>
+    </div>
+
+    <!-- ACHIEVEMENTS -->
+    <div class="section-page" id="pageAchieve">
+      <div class="achieve-hero">
+        <div class="achieve-hero-title">Достижения</div>
+        <div class="achieve-hero-sub">Открывай награды за активность на форуме</div>
+      </div>
+      <div class="achieve-summary">
+        <div class="ach-chip"><div class="ach-chip-val gold" id="achUnlockedCount">0</div><div class="ach-chip-label">открыто</div></div>
+        <div class="ach-chip"><div class="ach-chip-val" id="achTotalCount">0</div><div class="ach-chip-label">всего</div></div>
+      </div>
+      <div class="ach-section">🥠 Предсказания</div>
+      <div class="ach-grid" id="achGridFortune"></div>
+      <div class="ach-section">⚔️ Путь участника</div>
+      <div class="ach-grid" id="achGridRPG"></div>
+      <div class="ach-section">⭐ Секретные</div>
+      <div class="ach-grid" id="achGridSecret"></div>
+    </div>
+
+    <!-- RPG -->
+    <div class="section-page" id="pageRpg">
+      <!-- CREATE -->
+      <div id="rpgCreate">
+        <div class="rpg-hero">
+          <div class="rpg-hero-icon">⚔️</div>
+          <div class="rpg-hero-title">Путь участника</div>
+          <div class="rpg-hero-sub">Создай своего героя форума Машук</div>
+        </div>
+        <div class="rpg-create-card">
+          <div class="rpg-field">
+            <div class="rpg-label">Имя персонажа</div>
+            <input class="rpg-input" id="rpgCharName" type="text" placeholder="Как зовут твоего героя?">
+          </div>
+          <div class="rpg-field">
+            <div class="rpg-label">Выбери аватар</div>
+            <div class="avatar-grid" id="avatarGrid">
+              <div class="avatar-opt chosen" data-av="🧑‍🎓" onclick="selectAvatar(this,'🧑‍🎓')">🧑‍🎓</div>
+              <div class="avatar-opt" data-av="👩‍🎓" onclick="selectAvatar(this,'👩‍🎓')">👩‍🎓</div>
+              <div class="avatar-opt" data-av="🧑‍💻" onclick="selectAvatar(this,'🧑‍💻')">🧑‍💻</div>
+              <div class="avatar-opt" data-av="👩‍💻" onclick="selectAvatar(this,'👩‍💻')">👩‍💻</div>
+              <div class="avatar-opt" data-av="🧑‍🏫" onclick="selectAvatar(this,'🧑‍🏫')">🧑‍🏫</div>
+              <div class="avatar-opt" data-av="👩‍🏫" onclick="selectAvatar(this,'👩‍🏫')">👩‍🏫</div>
+              <div class="avatar-opt" data-av="🧑‍🎨" onclick="selectAvatar(this,'🧑‍🎨')">🧑‍🎨</div>
+              <div class="avatar-opt" data-av="👩‍🎨" onclick="selectAvatar(this,'👩‍🎨')">👩‍🎨</div>
+              <div class="avatar-opt" data-av="🧑‍🚀" onclick="selectAvatar(this,'🧑‍🚀')">🧑‍🚀</div>
+              <div class="avatar-opt" data-av="👩‍🚀" onclick="selectAvatar(this,'👩‍🚀')">👩‍🚀</div>
+            </div>
+          </div>
+          <div class="rpg-field">
+            <div class="rpg-label">Роль</div>
+            <div class="role-grid">
+              <div class="role-btn active" id="roleBtn0" onclick="selectRole('participant',0)">
+                <span class="role-emoji">🎯</span>
+                <div class="role-name">Участник</div>
+                <div class="role-bonus">+2 Лидерство</div>
+              </div>
+              <div class="role-btn" id="roleBtn1" onclick="selectRole('volunteer',1)">
+                <span class="role-emoji">🤝</span>
+                <div class="role-name">Волонтёр</div>
+                <div class="role-bonus">+2 Коммуникация</div>
+              </div>
+            </div>
+          </div>
+          <div class="rpg-field">
+            <div class="rpg-label">Распредели 10 очков</div>
+            <div class="pts-left">Осталось: <span id="rpgPtsLeft">10</span></div>
+            <div class="stat-rows">
+              <div class="stat-row"><div class="stat-left"><span class="stat-icon">👑</span><span class="stat-name">Лидерство</span></div><div class="stat-ctrl"><button class="stat-btn" onclick="chStat('leadership',-1)">−</button><span class="stat-val" id="sv-leadership">1</span><button class="stat-btn" onclick="chStat('leadership',1)">+</button></div></div>
+              <div class="stat-row"><div class="stat-left"><span class="stat-icon">🎨</span><span class="stat-name">Креативность</span></div><div class="stat-ctrl"><button class="stat-btn" onclick="chStat('creativity',-1)">−</button><span class="stat-val" id="sv-creativity">1</span><button class="stat-btn" onclick="chStat('creativity',1)">+</button></div></div>
+              <div class="stat-row"><div class="stat-left"><span class="stat-icon">💬</span><span class="stat-name">Коммуникация</span></div><div class="stat-ctrl"><button class="stat-btn" onclick="chStat('communication',-1)">−</button><span class="stat-val" id="sv-communication">1</span><button class="stat-btn" onclick="chStat('communication',1)">+</button></div></div>
+              <div class="stat-row"><div class="stat-left"><span class="stat-icon">✅</span><span class="stat-name">Ответственность</span></div><div class="stat-ctrl"><button class="stat-btn" onclick="chStat('responsibility',-1)">−</button><span class="stat-val" id="sv-responsibility">1</span><button class="stat-btn" onclick="chStat('responsibility',1)">+</button></div></div>
+            </div>
+          </div>
+          <button class="btn-primary" onclick="createChar()" style="margin-top:6px;">⚔️ Начать путь</button>
+        </div>
+      </div>
+
+      <!-- MAIN RPG -->
+      <div id="rpgMain" style="display:none;">
+        <div class="char-card">
+          <div class="char-top">
+            <div class="char-avatar-wrap">
+              <div id="charAvatarSVG" style="width:56px;height:56px;border-radius:16px;background:rgba(255,85,0,.12);border:2px solid rgba(255,85,0,.3);display:flex;align-items:center;justify-content:center;font-size:30px;"></div>
+              <div class="char-level-badge" id="charLevelBadge">1</div>
+            </div>
+            <div class="char-info">
+              <div class="char-name" id="charName">—</div>
+              <div class="char-role" id="charRole">—</div>
+              <div class="char-title" id="charTitle">Новичок</div>
+            </div>
+            <button class="share-btn" onclick="openShareModal()">↗ Поделиться</button>
+          </div>
+          <div class="xp-bar-wrap">
+            <div class="xp-bar"><div class="xp-fill" id="xpFill" style="width:0%"></div></div>
+            <div class="xp-label"><span id="xpCurrent">0</span> / <span id="xpNext">100</span> XP</div>
+          </div>
+          <div class="char-stats">
+            <div class="char-stat-chip"><span>👑</span><span id="cs-leadership">1</span></div>
+            <div class="char-stat-chip"><span>🎨</span><span id="cs-creativity">1</span></div>
+            <div class="char-stat-chip"><span>💬</span><span id="cs-communication">1</span></div>
+            <div class="char-stat-chip"><span>✅</span><span id="cs-responsibility">1</span></div>
+          </div>
+        </div>
+
+        <div class="event-loading" id="eventLoading"><div class="spin-ring"></div><div class="event-loading-txt">Загружаем событие дня...</div></div>
+        <div class="event-done" id="eventDone" style="display:none;">
+          <div class="done-icon">✅</div>
+          <div class="done-title">Событие дня завершено!</div>
+          <div class="done-result" id="doneResult"></div>
+          <div class="done-next">Следующее событие завтра</div>
+        </div>
+        <div class="event-card" id="eventCard" style="display:none;">
+          <div class="event-pixel-wrap" id="eventPixelWrap"></div>
+          <div class="event-type" id="eventType">📋 Ситуация</div>
+          <div class="event-day" id="eventDay"></div>
+          <div class="event-text" id="eventText"></div>
+          <div class="choices" id="eventChoices"></div>
+        </div>
+
+        <div class="section-title">🏆 Рейтинг игроков</div>
+        <div class="lb-rows" id="lbRows"><div style="text-align:center;padding:20px;color:var(--muted);font-size:12px;">Загрузка...</div></div>
+
+        <div style="text-align:center;margin-top:22px;">
+          <button class="btn-ghost" onclick="resetChar()" style="font-size:10px;opacity:.38;">Сбросить персонажа</button>
+        </div>
+      </div>
+    </div><!-- /pageRPG -->
+
+    <!-- FAQ -->
+    <div class="section-page" id="pageFaq">
+      <div class="faq-hero">
+        <div class="faq-hero-title">Вопросы и ответы</div>
+        <div class="faq-hero-sub">Всё, что нужно знать об участии в форуме</div>
+      </div>
+
+      <!-- ╔══════════════════════════════════════════════════════════╗
+           ║  FAQ — ВОПРОСЫ ДОБАВЛЯЮТСЯ ВРУЧНУЮ ЗДЕСЬ В КОД         ║
+           ║                                                          ║
+           ║  Чтобы добавить вопрос — скопируй блок ниже             ║
+           ║  и вставь перед закрывающим </div> (id="faqList")       ║
+           ║                                                          ║
+           ║  ШАБЛОН:                                                 ║
+           ║  <div class="faq-item" id="faqItemN">                   ║
+           ║    <div class="faq-q" onclick="toggleFaq('faqItemN')">  ║
+           ║      <div class="faq-q-text">Твой вопрос?</div>         ║
+           ║      <div class="faq-chevron">›</div>                   ║
+           ║    </div>                                                ║
+           ║    <div class="faq-a"><div class="faq-a-inner">         ║
+           ║      Текст ответа.                                       ║
+           ║    </div></div>                                          ║
+           ║  </div>                                                  ║
+           ║                                                          ║
+           ║  N — уникальный номер (1, 2, 3 …)                       ║
+           ╚══════════════════════════════════════════════════════════╝ -->
+
+      <div class="faq-list" id="faqList">
+
+        <!-- ════ УЧАСТНИКУ ════ -->
+        <div class="faq-category faq-category--participant">
+          <div class="faq-category-label">👤 Участнику</div>
+          <div class="faq-category-line"></div>
+        </div>
+
+        <!-- ── ВОПРОС У-1 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItem1">
+          <div class="faq-q" onclick="toggleFaq('faqItem1')">
+            <div class="faq-q-text">Кто может стать участником?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Участниками Форума могут стать граждане Российской Федерации в возрасте от 14 до 35 лет, а также граждане иностранных государств в возрасте от 18 до 35 лет, осуществляющие деятельность в сферах, соответствующих тематическим направлениям Форума согласно Положению.
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС У-2 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItem2">
+          <div class="faq-q" onclick="toggleFaq('faqItem2')">
+            <div class="faq-q-text">Где пройти регистрацию?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Для граждан Российской Федерации необходимо пройти регистрацию на ФГАИС «Молодежь России» по ссылке — <a href="https://myrosmol.ru/events/22637b71-f831-4449-a260-ec0b0ce47069?eventId=22637b71-f831-4449-a260-ec0b0ce47069" target="_blank" style="color:var(--cyan);">myrosmol.ru</a><br>
+            Для иностранных граждан, проживающих на территории Российской Федерации и за её пределами, и соотечественников необходимо пройти регистрацию на информационном ресурсе АНО «ДВФМ» — <a href="https://wyffest.com/events/mashuk-26" target="_blank" style="color:var(--cyan);">wyffest.com/events/mashuk-26</a>
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС У-3 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItem3">
+          <div class="faq-q" onclick="toggleFaq('faqItem3')">
+            <div class="faq-q-text">Когда будет выставлен статус заявки?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Статус заявки будет выставлен не менее, чем за 30 дней до начала смены Форума и не позднее, чем за 2 недели до начала смены Форума.
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС У-4 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItem4">
+          <div class="faq-q" onclick="toggleFaq('faqItem4')">
+            <div class="faq-q-text">Что взять с собой?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            <strong style="color:var(--white);">Список обязательных личных вещей (документов):</strong><br>
+            — паспорт (оригинал);<br>
+            — полис обязательного медицинского страхования (оригинал);<br>
+            — справка от врача по форме № 086-У для совершеннолетних / по форме № 073-У для несовершеннолетних + справка об отсутствии контактов с инфекционными больными;<br>
+            — согласие законного представителя на заселение несовершеннолетнего участника в АНО Центр знаний «Машук» (для несовершеннолетних);<br>
+            — согласие законного представителя на самостоятельное передвижение по территории РФ (для несовершеннолетних);<br>
+            — информированное добровольное согласие законного представителя на медицинское вмешательство (для несовершеннолетних).<br><br>
+            <strong style="color:var(--white);">Список рекомендуемых личных вещей:</strong><br>
+            удобная одежда по сезону, рубашка или майка с длинным рукавом, спортивный ветрозащитный костюм, тёплый свитер или кофта, носки, головной убор, удобная спортивная обувь, запасная пара обуви, тапочки для душа, полотенце, средства личной гигиены, дождевик, солнцезащитный крем, ручной фонарик и запас батареек, плед / индивидуальный спальный мешок / вкладыш / надувной матрас (по желанию — палатками, спальниками и ковриками участники обеспечиваются организаторами).
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС У-5 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItem5">
+          <div class="faq-q" onclick="toggleFaq('faqItem5')">
+            <div class="faq-q-text">Даты и место проведения</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Форум включает проведение 2 тематических смен:<br>
+            — с 08 по 15 августа 2026 года — смена «Взросление»;<br>
+            — с 15 по 22 августа 2026 года — смена «Единство».<br><br>
+            Площадки: г. Пятигорск, пр-кт Калинина, 1М (ГБУ ДО «ММПЦ «Машук»), подножье горы Машук, Комсомольская поляна — для совершеннолетних участников; г. Пятигорск, ул. Пионерлагерная, 8В (АНО «Центр знаний «Машук») — для несовершеннолетних участников.
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС У-6 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItem6">
+          <div class="faq-q" onclick="toggleFaq('faqItem6')">
+            <div class="faq-q-text">Чем отличаются смены?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            В смысловой и образовательной составляющей направлений смены. Ознакомиться можно по ссылке при регистрации.<br>
+            Внеучебная программа в сменах не отличается.
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС У-7 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItem7">
+          <div class="faq-q" onclick="toggleFaq('faqItem7')">
+            <div class="faq-q-text">Как проходит конкурсный отбор?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Конкурсный отбор проходит на основании заполненной Вами анкеты на платформе ФГАИС «Молодёжь России».<br><br>
+            По итогам конкурсного отбора Дирекцией формируются рейтинговые списки по каждому тематическому направлению Форума. На основании данного рейтинга Дирекция формирует итоговый список участников каждой смены в соответствии с их подтверждёнными заявками.<br><br>
+            В случае отказа отобранного по итогам конкурсного отбора претендента на участие в Форуме Дирекция приглашает претендента из резервного списка.<br><br>
+            Рейтинговые списки и резервные составы участников не публикуются.<br><br>
+            По итогам конкурсного отбора претендент на адрес электронной почты, указанной при регистрации, получает информационное письмо с результатом рассмотрения своей заявки на участие. Информационное письмо направляется каждому претенденту не позднее чем за 14 календарных дней до даты проведения Форума.<br><br>
+            Претендент, которому направлено персональное приглашение, должен подтвердить своё участие на Платформе через личный кабинет в течение 3 календарных дней с даты подтверждения заявки Организатором.<br><br>
+            После завершения конкурсного отбора списки отобранных кандидатов из субъектов РФ по каждой смене направляются в органы исполнительной власти субъектов РФ в сфере молодёжной политики для формирования состава региональных делегаций. Окончательный срок формирования списка — не позднее чем за 14 календарных дней до даты начала Форума. Список участников не подлежит официальному опубликованию.
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС У-8 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItem8">
+          <div class="faq-q" onclick="toggleFaq('faqItem8')">
+            <div class="faq-q-text">Проводится ли грантовый конкурс в рамках форума?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Подробности после официального анонса!<br><br>
+            Регистрация на конкурс Росмолодёжь.Гранты начнётся 16 апреля в 12:00 МСК. Минимальная сумма — 5 000 руб., максимальная — 1 500 000 руб. Все 18 номинаций.<br><br>
+            Для участников 1 смены регистрация завершится в 12:00 3 августа.<br>
+            Для участников 2 смены регистрация завершится в 12:00 10 августа.<br><br>
+            В Конкурсе могут принимать участие граждане Российской Федерации в возрасте от 14 до 35 лет включительно.
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС У-9 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItem9">
+          <div class="faq-q" onclick="toggleFaq('faqItem9')">
+            <div class="faq-q-text">Участие в форуме платное?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Участие в программе форума бесплатное.<br><br>
+            Оплата проезда участников Форума от места проживания (пребывания) до места проведения (Ставропольский край, г. Пятигорск) и в обратном направлении осуществляется за счёт денежных средств направляющей стороны (уполномоченного органа исполнительной власти субъекта Российской Федерации в сфере молодёжной политики, работодателя, образовательной организации и иных организаций) или за счёт собственных денежных средств участника Форума.<br><br>
+            Трансфер от места прибытия (аэропорт, железнодорожный вокзал, автовокзал) до площадки проведения Форума осуществляется за счёт денежных средств Организаторов по установленному заранее графику.<br><br>
+            Проживание и питание участников в месте проведения Форума осуществляется за счёт денежных средств Организаторов.<br><br>
+            Направляющей стороной может выступать субъект Российской Федерации в лице регионального органа исполнительной власти в сфере молодёжной политики (РОИВ), образовательные организации и работодатели.
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС У-10 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItem10">
+          <div class="faq-q" onclick="toggleFaq('faqItem10')">
+            <div class="faq-q-text">Возможно ли скорректировать информацию в поданной заявке на форум?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Корректировка заявки возможна только в том случае, если регистрация на форум ещё доступна, и заявка находится в статусе «На рассмотрении». Для этого необходимо отозвать старую заявку и пройти регистрацию заново.
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС У-11 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItem11">
+          <div class="faq-q" onclick="toggleFaq('faqItem11')">
+            <div class="faq-q-text">Как верифицировать аккаунт во ФГАИС «Молодёжь России» через Госуслуги?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Вам необходимо зайти в Ваш аккаунт во ФГАИС «Молодёжь России» (<a href="https://myrosmol.ru" target="_blank" style="color:var(--cyan);">myrosmol.ru</a>) в раздел «Редактировать профиль» и нажать на кнопку «Верифицировать через Госуслуги».
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС У-12 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItem12">
+          <div class="faq-q" onclick="toggleFaq('faqItem12')">
+            <div class="faq-q-text">Техническая ошибка</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Если у Вас не получается отправить заявку, проверьте, что Вы верно заполнили все обязательные поля заявки.<br><br>
+            Если ошибка не пропала, напишите нам на почту с указанием ID Вашего личного кабинета и адреса электронной почты, к которому он привязан, и описанием проблемы или обратитесь к Девятайкиной Алёне Максимовне, руководителю службы по работе с участниками: +7 (918) 803-80-62, <span style="color:var(--cyan);">info&#64;mashuk&#45;forum&#46;ru</span>
+          </div></div>
+        </div>
+
+        <!-- ════ ВОЛОНТЁРУ ════ -->
+        <div class="faq-category faq-category--volunteer">
+          <div class="faq-category-line"></div>
+          <div class="faq-category-label">🤝 Волонтёру</div>
+          <div class="faq-category-line"></div>
+        </div>
+
+        <!-- ── ВОПРОС В-1 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItemV1">
+          <div class="faq-q" onclick="toggleFaq('faqItemV1')">
+            <div class="faq-q-text">Как подать заявку на участие в форуме в качестве волонтёра?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Для участия в Волонтёрском корпусе каждый кандидат должен зарегистрироваться в единой информационной системе развития добровольчества (волонтёрства) по ссылке — <a href="https://dobro.ru/event/11619656" target="_blank" style="color:var(--orange);">dobro.ru/event/11619656</a>
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС В-2 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItemV2">
+          <div class="faq-q" onclick="toggleFaq('faqItemV2')">
+            <div class="faq-q-text">Кто может стать волонтёром?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Участниками Волонтёрского корпуса могут стать граждане Российской Федерации в возрасте от 18 лет на момент заполнения анкеты кандидата.
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС В-3 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItemV3">
+          <div class="faq-q" onclick="toggleFaq('faqItemV3')">
+            <div class="faq-q-text">Что включает в себя конкурсный отбор?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Конкурсный отбор кандидатов в Волонтёрский корпус осуществляется в несколько этапов:<br>
+            — приём заявок;<br>
+            — рассмотрение и отбор анкет потенциальных кандидатов;<br>
+            — обучение и подготовка.
+          </div></div>
+        </div>
+
+        <!-- ── ВОПРОС В-4 ────────────────────────────────── -->
+        <div class="faq-item" id="faqItemV4">
+          <div class="faq-q" onclick="toggleFaq('faqItemV4')">
+            <div class="faq-q-text">Какие условия предоставляют организаторы?</div>
+            <div class="faq-chevron">›</div>
+          </div>
+          <div class="faq-a"><div class="faq-a-inner">
+            Оплата проезда волонтёров Волонтёрского корпуса от места проживания (пребывания) до места проведения Форума (Ставропольский край, г. Пятигорск) и в обратном направлении осуществляется за счёт денежных средств направляющей стороны (уполномоченного органа исполнительной власти субъекта Российской Федерации в сфере молодёжной политики, работодателя, образовательной организации и других организаций) или за счёт собственных денежных средств волонтёра.<br><br>
+            Проживание, питание, а также обеспечение единой экипировкой участников Волонтёрского корпуса осуществляется за счёт средств Организаторов.
+          </div></div>
+        </div>
+
+        <!-- ── ДОБАВЬ НОВЫЙ ВОПРОС СЮДА ─────────────────
+             Участник: следующий номер faqItem13
+             Волонтёр:  следующий номер faqItemV5
+        ──────────────────────────────────────────────── -->
+
+      </div>
+    </div>
+
+  </div><!-- /sectionWrap -->
+
+</div><!-- /appWrap -->
+</div><!-- /main -->
+
+<!-- SHARE MODAL -->
+<div class="modal-overlay" id="shareModal">
+  <div class="modal-box">
+    <div class="modal-title">⚔️ Карточка персонажа</div>
+    <div class="share-preview">
+      <div class="share-header-txt">МАШУК 17 · ПУТЬ УЧАСТНИКА</div>
+      <div id="sharePixelAvatar" style="display:flex;justify-content:center;margin-bottom:10px;"></div>
+      <div style="font-family:'Unbounded',sans-serif;font-size:16px;font-weight:900;color:var(--white);margin-bottom:3px;" id="shareNameTxt">—</div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:2px;" id="shareRoleTxt">—</div>
+      <div style="font-family:'Unbounded',sans-serif;font-size:10px;color:var(--cyan);margin-bottom:12px;" id="shareLevelTxt">Уровень 1</div>
+      <div class="share-stats-row" id="shareStatsPills"></div>
+    </div>
+    <button class="btn-primary" onclick="copyShare()" style="margin-bottom:10px;">📋 Скопировать</button>
+    <button class="btn-ghost" onclick="closeShareModal()" style="width:100%;text-align:center;">Закрыть</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>
+// ════════════════════════════════
+//  HELPERS
+// ════════════════════════════════
+function $(id){return document.getElementById(id);}
+function show(id,d='block'){$(id).style.display=d;}
+function hide(id){$(id).style.display='none';}
+function showToast(msg,type=''){const t=$('toast');t.textContent=msg;t.className='toast show'+(type?' '+type:'');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),2800);}
+function todayStr(){const d=new Date();return `${d.getFullYear()}_${d.getMonth()}_${d.getDate()}`;}
+function todayLabel(){return new Date().toLocaleDateString('ru-RU',{day:'2-digit',month:'long',year:'numeric'});}
+function rng(seed){return((seed*1664525+1013904223)&0x7fffffff);}
+
+// ════════════════════════════════
+//  NAVIGATION (SPA — единое управление состоянием)
+// ════════════════════════════════
+const PAGES=['home','fortune','achieve','rpg','faq'];
+let currentPage='home';
+
+function navigateTo(page){
+  // Сбрасываем все страницы
+  PAGES.forEach(p=>{
+    const el=$(('page'+p.charAt(0).toUpperCase()+p.slice(1)));
+    if(el) el.classList.remove('active');
+  });
+
+  // Показываем/скрываем заголовок в хедере
+  const heroTitle=document.querySelector('.hero-title');
+  const heroSub=document.querySelector('.hero-sub');
+  if(page==='home'){
+    if(heroTitle) heroTitle.classList.add('hidden-on-home');
+    if(heroSub) heroSub.classList.add('hidden-on-home');
+  } else {
+    if(heroTitle) heroTitle.classList.remove('hidden-on-home');
+    if(heroSub) heroSub.classList.remove('hidden-on-home');
+  }
+
+  if(page==='home'){
+    hide('sectionWrap');
+    show('pageHome','block');
+    $('pageHome').classList.add('active');
+    currentPage='home';
+    return;
+  }
+
+  hide('pageHome');
+  show('sectionWrap','block');
+  const pid='page'+page.charAt(0).toUpperCase()+page.slice(1);
+  const el=$(pid);
+  if(el) el.classList.add('active');
+  currentPage=page;
+
+  if(page==='fortune')   initFortune();
+  if(page==='achieve')   initAchievements();
+  if(page==='rpg')       initRPG();
+  if(page==='faq')       initFaq();
+
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+
+// ════════════════════════════════
+//  ONBOARDING
+// ════════════════════════════════
+let obStep=0;
+function obNext(){
+  if(obStep<2){ obStep++; updateOb(); }
+  else obSkip();
+}
+function updateOb(){
+  document.querySelectorAll('.ob-slide').forEach((s,i)=>s.classList.toggle('active',i===obStep));
+  document.querySelectorAll('.ob-dot').forEach((d,i)=>d.classList.toggle('active',i===obStep));
+  $('obBtn').textContent=obStep===2?'Начать ⚔️':'Далее →';
+}
+function obSkip(){
+  localStorage.setItem('ob_done','1');
+  hide('onboarding');
+}
+function checkOnboarding(){
+  if(!localStorage.getItem('ob_done')){ $('onboarding').classList.add('active'); }
+}
+
+// ════════════════════════════════
+//  AVATAR & EVENT EMOJI HELPERS
+// ════════════════════════════════
+const AVATAR_EMOJIS=['🧑‍🎓','👩‍🎓','🧑‍💻','👩‍💻','🧑‍🏫','👩‍🏫','🧑‍🎨','👩‍🎨','🧑‍🚀','👩‍🚀'];
+let selectedAvatar='🧑‍🎓';
+
+function selectAvatar(el,emoji){
+  document.querySelectorAll('.avatar-opt').forEach(o=>o.classList.remove('chosen'));
+  el.classList.add('chosen');
+  selectedAvatar=emoji;
+}
+
+function makeCharAvatar(role,stats,size=56,avatar){
+  // Legacy SVG stub — replaced by emoji. Returns empty string.
+  return '';
+}
+
+function UNUSED_makeCharAvatar_SVG(role,stats,size=56){
+  const colors={
+    participant:{body:'#a855f7',head:'#0deeff',acc:'#ff5500'},
+    volunteer:{body:'#e879f9',head:'#f59e0b',acc:'#0deeff'}
+  };
+  const c=colors[role]||colors.participant;
+  const totalStats=Object.values(stats||{}).reduce((a,b)=>a+b,0);
+  const aura=totalStats>20?'#FFD700':totalStats>14?'#a855f7':'transparent';
+  return `<svg width="${size}" height="${size}" viewBox="0 0 12 12" style="image-rendering:pixelated;display:block;">
+    ${aura!=='transparent'?`<rect x="1" y="1" width="10" height="10" fill="${aura}" opacity=".18" rx="2"/>`:''}
+    <rect x="4" y="0" width="4" height="4" fill="${c.head}"/>
+    <rect x="4" y="1" width="1" height="1" fill="#050508"/><rect x="7" y="1" width="1" height="1" fill="#050508"/>
+    <rect x="4" y="3" width="4" height="1" fill="#050508"/>
+    <rect x="3" y="4" width="6" height="4" fill="${c.body}"/>
+    <rect x="1" y="5" width="2" height="3" fill="${c.body}" opacity=".8"/>
+    <rect x="9" y="5" width="2" height="3" fill="${c.body}" opacity=".8"/>
+    <rect x="3" y="8" width="2" height="3" fill="${c.acc}"/>
+    <rect x="7" y="8" width="2" height="3" fill="${c.acc}"/>
+    ${(stats&&stats.leadership>5)?`<rect x="5" y="0" width="2" height="1" fill="#FFD700"/>`:''}`
+    + `</svg>`;
+}
+
+function makeEventPixel(type){
+  const arts={
+    team:`<svg width="80" height="60" viewBox="0 0 16 12" style="image-rendering:pixelated;">
+      <rect x="1" y="2" width="3" height="3" fill="#0deeff"/><rect x="6" y="2" width="3" height="3" fill="#a855f7"/>
+      <rect x="11" y="2" width="3" height="3" fill="#ff5500"/>
+      <rect x="1" y="5" width="3" height="4" fill="#0deeff" opacity=".7"/><rect x="6" y="5" width="3" height="4" fill="#a855f7" opacity=".7"/>
+      <rect x="11" y="5" width="3" height="4" fill="#ff5500" opacity=".7"/>
+      <rect x="4" y="6" width="2" height="1" fill="#FFD700"/><rect x="9" y="6" width="2" height="1" fill="#FFD700"/>
+      <rect x="7" y="9" width="2" height="1" fill="#FFD700"/>
+    </svg>`,
+    pitch:`<svg width="80" height="60" viewBox="0 0 16 12" style="image-rendering:pixelated;">
+      <rect x="2" y="1" width="12" height="8" fill="rgba(168,85,247,.2)" rx="1"/>
+      <rect x="2" y="1" width="12" height="1" fill="#a855f7"/>
+      <rect x="4" y="3" width="3" height="1" fill="rgba(255,255,255,.3)"/>
+      <rect x="4" y="5" width="5" height="1" fill="rgba(255,255,255,.3)"/>
+      <rect x="4" y="7" width="4" height="1" fill="rgba(255,255,255,.3)"/>
+      <rect x="7" y="10" width="2" height="2" fill="#a855f7"/>
+      <rect x="4" y="2" width="1" height="6" fill="#e879f9" opacity=".6"/>
+    </svg>`,
+    conflict:`<svg width="80" height="60" viewBox="0 0 16 12" style="image-rendering:pixelated;">
+      <rect x="1" y="3" width="4" height="4" fill="#ff5500" opacity=".8"/>
+      <rect x="11" y="3" width="4" height="4" fill="#0deeff" opacity=".8"/>
+      <rect x="7" y="5" width="2" height="2" fill="#FFD700"/>
+      <rect x="5" y="4" width="2" height="1" fill="#ff5500"/><rect x="9" y="4" width="2" height="1" fill="#0deeff"/>
+      <rect x="5" y="6" width="2" height="1" fill="#ff5500"/><rect x="9" y="6" width="2" height="1" fill="#0deeff"/>
+      <rect x="6" y="2" width="4" height="1" fill="rgba(255,255,255,.15)"/>
+      <rect x="6" y="9" width="4" height="1" fill="rgba(255,255,255,.15)"/>
+    </svg>`,
+    network:`<svg width="80" height="60" viewBox="0 0 16 12" style="image-rendering:pixelated;">
+      <rect x="7" y="1" width="2" height="2" fill="#FFD700"/>
+      <rect x="1" y="5" width="2" height="2" fill="#0deeff"/>
+      <rect x="13" y="5" width="2" height="2" fill="#e879f9"/>
+      <rect x="4" y="9" width="2" height="2" fill="#a855f7"/>
+      <rect x="10" y="9" width="2" height="2" fill="#ff5500"/>
+      <rect x="8" y="3" width="1" height="3" fill="rgba(255,255,255,.2)"/>
+      <rect x="3" y="6" width="5" height="1" fill="rgba(255,255,255,.2)"/>
+      <rect x="8" y="6" width="5" height="1" fill="rgba(255,255,255,.2)"/>
+      <rect x="5" y="9" width="3" height="1" fill="rgba(255,255,255,.2)"/>
+      <rect x="9" y="9" width="2" height="1" fill="rgba(255,255,255,.2)"/>
+    </svg>`,
+    project:`<svg width="80" height="60" viewBox="0 0 16 12" style="image-rendering:pixelated;">
+      <rect x="2" y="2" width="12" height="8" fill="rgba(13,238,255,.1)"/>
+      <rect x="2" y="2" width="12" height="1" fill="#0deeff"/>
+      <rect x="2" y="2" width="1" height="8" fill="#0deeff"/>
+      <rect x="4" y="4" width="4" height="1" fill="rgba(255,255,255,.3)"/>
+      <rect x="4" y="6" width="6" height="1" fill="rgba(255,255,255,.3)"/>
+      <rect x="4" y="8" width="3" height="1" fill="rgba(255,255,255,.3)"/>
+      <rect x="10" y="4" width="2" height="5" fill="#a855f7" opacity=".6"/>
+    </svg>`,
+    speech:`<svg width="80" height="60" viewBox="0 0 16 12" style="image-rendering:pixelated;">
+      <rect x="3" y="8" width="10" height="1" fill="rgba(255,255,255,.15)"/>
+      <rect x="6" y="1" width="4" height="4" fill="#e879f9"/>
+      <rect x="6" y="2" width="1" height="1" fill="#050508"/><rect x="9" y="2" width="1" height="1" fill="#050508"/>
+      <rect x="6" y="4" width="4" height="1" fill="#050508"/>
+      <rect x="5" y="5" width="6" height="3" fill="#e879f9" opacity=".7"/>
+      <rect x="3" y="9" width="2" height="3" fill="#a855f7"/>
+      <rect x="11" y="9" width="2" height="3" fill="#a855f7"/>
+      <rect x="1" y="7" width="2" height="1" fill="#0deeff" opacity=".5"/>
+      <rect x="13" y="7" width="2" height="1" fill="#0deeff" opacity=".5"/>
+    </svg>`,
+    opportunity:`<svg width="80" height="60" viewBox="0 0 16 12" style="image-rendering:pixelated;">
+      <rect x="6" y="1" width="4" height="4" fill="#FFD700"/>
+      <rect x="5" y="2" width="1" height="2" fill="#FFD700"/><rect x="10" y="2" width="1" height="2" fill="#FFD700"/>
+      <rect x="4" y="3" width="1" height="2" fill="#FFD700"/><rect x="11" y="3" width="1" height="2" fill="#FFD700"/>
+      <rect x="7" y="2" width="2" height="2" fill="#ff8800"/>
+      <rect x="6" y="6" width="4" height="5" fill="#a855f7"/>
+      <rect x="4" y="7" width="2" height="4" fill="#a855f7" opacity=".7"/>
+      <rect x="10" y="7" width="2" height="4" fill="#a855f7" opacity=".7"/>
+    </svg>`
+  };
+  return arts[type]||arts.project;
+}
+
+// ════════════════════════════════
+//  FORTUNE
+// ════════════════════════════════
+const FORTUNES=[
+  {text:'Сегодня твоя идея, которую ты считал <em>случайной</em>, окажется самой важной.',lucky:['🔢 7','🎨 Синий','⭐ Утро']},
+  {text:'Маленький шаг вперёд сегодня — это <em>огромный прыжок</em> для твоего будущего.',lucky:['🔢 3','🎨 Золотой','⭐ Полдень']},
+  {text:'Кто-то рядом с тобой ждёт, что ты <em>первым</em> скажешь «привет».',lucky:['🔢 11','🎨 Зелёный','⭐ Вечер']},
+  {text:'Твоя <em>интуиция</em> сегодня острее любого аргумента — доверяй ей.',lucky:['🔢 5','🎨 Фиолетовый','⭐ Закат']},
+  {text:'Вопрос, который ты боялся задать, <em>откроет дверь</em>, которую ты давно ищешь.',lucky:['🔢 8','🎨 Оранжевый','⭐ Утро']},
+  {text:'Сегодня вселенная говорит тебе: <em>притормози</em> — и ты заметишь нечто прекрасное.',lucky:['🔢 1','🎨 Розовый','⭐ Рассвет']},
+  {text:'Твоя <em>настойчивость</em> сегодня удивит даже тебя самого.',lucky:['🔢 17','🎨 Красный','⭐ День']},
+  {text:'То, что кажется концом, на самом деле является <em>новым началом</em>.',lucky:['🔢 4','🎨 Серебряный','⭐ Закат']},
+  {text:'Твоя <em>улыбка</em> сегодня изменит чей-то день — не скупись на неё.',lucky:['🔢 6','🎨 Жёлтый','⭐ Вечер']},
+  {text:'Смелость — это не отсутствие страха, а решение, что <em>мечта важнее</em> страха.',lucky:['🔢 13','🎨 Индиго','⭐ Ночь']},
+  {text:'Сегодня хороший день, чтобы стать <em>той версией себя</em>, которой ты хочешь быть.',lucky:['🔢 21','🎨 Мятный','⭐ Утро']},
+  {text:'Сегодня ты ближе к цели, чем <em>вчера</em>, — даже если этого не чувствуешь.',lucky:['🔢 14','🎨 Небесный','⭐ Полдень']},
+  {text:'Не жди идеального момента — <em>создай</em> его сам.',lucky:['🔢 15','🎨 Медный','⭐ День']},
+  {text:'Твоя <em>уникальность</em> — не недостаток, а твоя суперсила.',lucky:['🔢 8','🎨 Ультрафиолет','⭐ Ночь']},
+  {text:'Доверяй процессу: даже <em>хаос</em> складывается в узор.',lucky:['🔢 55','🎨 Терракотовый','⭐ Закат']},
+  {text:'Твоя <em>история</em> ещё не дописана — лучшие главы впереди.',lucky:['🔢 99','🎨 Золотой','⭐ Рассвет']},
+  {text:'Сегодня вселенная играет на твоей стороне — <em>сделай ход</em>.',lucky:['🔢 77','🎨 Электрик','⭐ Закат']},
+  {text:'Самое важное решение сегодня — это выбрать <em>себя</em>.',lucky:['🔢 88','🎨 Рубиновый','⭐ День']},
+  {text:'Твой <em>путь</em> уникален — не трать время на чужую карту.',lucky:['🔢 36','🎨 Стальной','⭐ День']},
+  {text:'Сегодня маленькое <em>«да»</em> себе изменит многое.',lucky:['🔢 14','🎨 Сиреневый','⭐ Закат']},
+  {text:'Энергия, которую ты вкладываешь сегодня, <em>вернётся</em> к тебе сторицей.',lucky:['🔢 2','🎨 Янтарный','⭐ Утро']},
+  {text:'Твоё <em>молчание</em> сегодня может сказать больше, чем тысяча слов.',lucky:['🔢 9','🎨 Лазурный','⭐ Полдень']},
+  {text:'Сегодня самое время посмотреть на проблему с <em>другой стороны</em>.',lucky:['🔢 12','🎨 Оливковый','⭐ День']},
+  {text:'Твоя <em>любопытность</em> откроет сегодня нечто, что давно ждало тебя.',lucky:['🔢 23','🎨 Коралловый','⭐ Вечер']},
+  {text:'Не бойся выглядеть <em>иначе</em> — именно это делает тебя запоминающимся.',lucky:['🔢 31','🎨 Бирюзовый','⭐ Закат']},
+  {text:'Сегодня маленькая <em>благодарность</em> создаст большую волну радости.',lucky:['🔢 18','🎨 Розовый','⭐ Рассвет']},
+  {text:'Твоя <em>смелость</em> вдохновит кого-то рядом с тобой сделать первый шаг.',lucky:['🔢 44','🎨 Золотой','⭐ День']},
+  {text:'Сегодня — день, когда <em>случайная встреча</em> может стать важной.',lucky:['🔢 7','🎨 Сапфировый','⭐ Вечер']},
+  {text:'Позволь себе <em>не знать ответа</em> — это начало настоящего открытия.',lucky:['🔢 16','🎨 Стальной','⭐ Ночь']},
+  {text:'Твоя <em>внимательность</em> сегодня поможет заметить то, что другие пропустят.',lucky:['🔢 33','🎨 Изумрудный','⭐ Утро']},
+  {text:'Каждое препятствие — это тренажёр для твоей будущей <em>силы</em>.',lucky:['🔢 27','🎨 Гранатовый','⭐ Полдень']},
+  {text:'Сегодня твоё <em>творчество</em> найдёт выход там, где ты его не ждёшь.',lucky:['🔢 19','🎨 Шафрановый','⭐ День']},
+  {text:'Один честный <em>разговор</em> сегодня стоит больше, чем неделя раздумий.',lucky:['🔢 48','🎨 Серебряный','⭐ Вечер']},
+  {text:'Ты уже <em>достаточно</em> — именно сейчас, именно таким.',lucky:['🔢 3','🎨 Белый','⭐ Рассвет']},
+  {text:'Сегодня вселенная намекает: <em>отпусти</em> то, что мешает двигаться.',lucky:['🔢 22','🎨 Фуксия','⭐ Закат']},
+  {text:'Твоя <em>открытость</em> новому опыту сегодня принесёт неожиданный подарок.',lucky:['🔢 56','🎨 Индиго','⭐ Ночь']},
+  {text:'Сегодня твоя <em>командная работа</em> создаст что-то большее, чем ты думаешь.',lucky:['🔢 10','🎨 Мятный','⭐ Утро']},
+  {text:'Пусть сегодня твоё сердце будет <em>легче</em>, чем вчера.',lucky:['🔢 38','🎨 Лавандовый','⭐ Полдень']},
+  {text:'Твоя <em>энергия</em> заразительна — неси её тем, кто рядом.',lucky:['🔢 64','🎨 Оранжевый','⭐ День']},
+  {text:'Один <em>нестандартный вопрос</em> сегодня изменит ход всей беседы.',lucky:['🔢 41','🎨 Жёлтый','⭐ Вечер']},
+  {text:'Сегодня — день, когда стоит позвонить тому, кому <em>давно хотел</em>.',lucky:['🔢 29','🎨 Медный','⭐ Закат']},
+  {text:'Твоя <em>интуиция</em> — это опыт, говорящий шёпотом. Прислушайся.',lucky:['🔢 52','🎨 Ультрамарин','⭐ Рассвет']},
+  {text:'Сегодня каждая маленькая победа — это <em>ступенька</em> к большой цели.',lucky:['🔢 6','🎨 Терракотовый','⭐ Утро']},
+  {text:'Твой <em>фокус</em> сегодня — твоё суперсила. Направь его на главное.',lucky:['🔢 37','🎨 Небесный','⭐ Полдень']},
+  {text:'Сегодня ты увидишь в <em>простом</em> нечто невероятно важное.',lucky:['🔢 15','🎨 Зелёный','⭐ День']},
+  {text:'Самый важный человек в твоей жизни сегодня — это <em>ты</em>.',lucky:['🔢 43','🎨 Рубиновый','⭐ Вечер']},
+  {text:'Сегодня смело делись <em>своими мыслями</em> — мир ждёт именно их.',lucky:['🔢 26','🎨 Фиолетовый','⭐ Ночь']},
+  {text:'Твоя <em>доброта</em> сегодня вернётся к тебе в самый неожиданный момент.',lucky:['🔢 11','🎨 Розовый','⭐ Утро']},
+  {text:'Позволь себе <em>ошибиться</em> — именно из этого рождается мастерство.',lucky:['🔢 34','🎨 Золотой','⭐ Рассвет']},
+  {text:'Сегодня твой <em>голос</em> в нужном месте изменит многое.',lucky:['🔢 57','🎨 Электрик','⭐ День']},
+  {text:'Твоя <em>гибкость</em> сегодня поможет найти выход там, где казалось тупик.',lucky:['🔢 8','🎨 Лазурный','⭐ Вечер']},
+  {text:'Сегодня вселенная дарит тебе <em>неожиданный союзник</em>.',lucky:['🔢 61','🎨 Сиреневый','⭐ Закат']},
+  {text:'Твоя <em>честность</em> с собой сегодня освободит тебя от лишнего груза.',lucky:['🔢 20','🎨 Белый','⭐ Ночь']},
+  {text:'Сегодня даже <em>маленький жест</em> заботы создаст огромную разницу.',lucky:['🔢 46','🎨 Янтарный','⭐ Утро']},
+  {text:'Сегодня твоя <em>смелость</em> сказать «нет» откроет путь к тому, что действительно важно.',lucky:['🔢 25','🎨 Коралловый','⭐ Полдень']},
+  {text:'Сегодня лучший момент, чтобы начать то, что ты <em>откладывал</em>.',lucky:['🔢 17','🎨 Мятный','⭐ День']},
+  {text:'Твой <em>потенциал</em> больше, чем ты позволяешь себе думать.',lucky:['🔢 53','🎨 Бирюзовый','⭐ Вечер']},
+  {text:'Сегодня твоя <em>страсть</em> к делу убедит тех, кого не убедили бы слова.',lucky:['🔢 39','🎨 Гранатовый','⭐ Закат']},
+  {text:'Каждое «нет», которое ты слышишь, — это стрелка, указывающая в <em>правильном направлении</em>.',lucky:['🔢 60','🎨 Серебряный','⭐ Рассвет']},
+  {text:'Сегодня твоя <em>радость</em> — это не награда за усилия, а топливо для них.',lucky:['🔢 42','🎨 Оранжевый','⭐ День']},
+];
+function getTodayFortuneKey(){return`fortune_${todayStr()}`;}
+
+// Возвращает индекс предсказания для данного дня.
+// Алгоритм: строим персональную перестановку FORTUNES через Fisher-Yates shuffle
+// с сидом из uid пользователя, затем выбираем элемент по номеру дня с начала эпохи.
+// Это гарантирует: одно предсказание НЕ повторится раньше чем через FORTUNES.length дней.
+function getTodayFortuneIdx(){
+  const n=FORTUNES.length;
+  // Сид перемешивания — только от uid (не меняется день ото дня)
+  const _fuid=(typeof _getUID==='function'?_getUID():null)||'guest';
+  let uidSeed=0;
+  for(let i=0;i<_fuid.length;i++) uidSeed=Math.imul(uidSeed*31+_fuid.charCodeAt(i),1)|0;
+  uidSeed=Math.abs(uidSeed)+1;
+
+  // Многоходовой LCG (лучшее перемешивание)
+  function lcg(s){ return(Math.imul(s,1664525)+1013904223)&0x7fffffff; }
+
+  // Строим перестановку индексов [0..n-1] (Fisher-Yates)
+  const perm=Array.from({length:n},(_,i)=>i);
+  let s=uidSeed;
+  for(let i=n-1;i>0;i--){
+    s=lcg(s); const j=s%( i+1);
+    [perm[i],perm[j]]=[perm[j],perm[i]];
+  }
+
+  // Номер дня с начала Unix-эпохи (меняется раз в сутки, одинаково для всех TZ в рамках форума)
+  const dayNum=Math.floor(Date.now()/86400000);
+  return perm[dayNum%n];
+}
+
+function initFortune(){
+  const saved=localStorage.getItem(getTodayFortuneKey());
+  if(saved){try{showFortuneResult(JSON.parse(saved),true);}catch(e){}}
+}
+function crackCookie(){
+  const btn=$('cookieBtn');
+  if(btn.classList.contains('cracked'))return;
+  const key=getTodayFortuneKey();
+  if(localStorage.getItem(key)){initFortune();return;}
+  btn.classList.add('cracked');
+  hide('fortuneHint');
+  const svg=$('cookieSvg');
+  setTimeout(()=>{
+    $('cookieWhole').style.display='none';
+    svg.innerHTML=`<g>
+      <rect x="155" y="15" width="100" height="110" rx="32" fill="#0deeff" style="transform-origin:205px 70px;animation:flyUp .45s cubic-bezier(.23,1,.32,1) both;"/>
+      <rect x="155" y="285" width="100" height="110" rx="32" fill="#0deeff" style="transform-origin:205px 340px;animation:flyDown .45s cubic-bezier(.23,1,.32,1) both;"/>
+      <rect x="15" y="155" width="110" height="100" rx="32" fill="#0deeff" style="transform-origin:70px 205px;animation:flyLeft .45s cubic-bezier(.23,1,.32,1) both;"/>
+      <rect x="285" y="155" width="110" height="100" rx="32" fill="#0deeff" style="transform-origin:340px 205px;animation:flyRight .45s cubic-bezier(.23,1,.32,1) both;"/>
+      <path d="M205 80 C205 80 230 145 230 205 C230 265 205 330 205 330 C205 330 180 265 180 205 C180 145 205 80 205 80Z" fill="#ff5500" style="animation:starShrink .45s ease both;"/>
+      <path d="M80 205 C80 205 145 180 205 180 C265 180 330 205 330 205 C330 205 265 230 205 230 C145 230 80 205 80 205Z" fill="#ff5500" style="animation:starShrink .45s ease both;"/>
+    </g>
+    <style>
+      @keyframes flyUp{to{transform:translateY(-30px) rotate(-15deg);opacity:.7;}}
+      @keyframes flyDown{to{transform:translateY(30px) rotate(15deg);opacity:.7;}}
+      @keyframes flyLeft{to{transform:translateX(-30px) rotate(15deg);opacity:.7;}}
+      @keyframes flyRight{to{transform:translateX(30px) rotate(-15deg);opacity:.7;}}
+      @keyframes starShrink{to{transform:scale(.6);opacity:.8;}}
+    </style>`;
+    const idx=getTodayFortuneIdx();
+    const data={...FORTUNES[idx],date:todayLabel()};
+    localStorage.setItem(key,JSON.stringify(data));
+    if(window._fbSaveFortune)_fbSaveFortune(key,data);
+    setTimeout(()=>{showFortuneResult(data,false);setTimeout(()=>initAchievements(),300);},400);
+  },350);
+}
+function showFortuneResult(data,had){
+  if(had){$('fortuneAlready').classList.add('show');hide('fortuneHint');$('cookieBtn').classList.add('cracked');}
+  $('fortuneDateLabel').textContent=data.date;
+  $('fortuneTextEl').innerHTML=data.text;
+  $('fortuneLucky').innerHTML=(data.lucky||[]).map(l=>`<span class="lucky-item">${l}</span>`).join('');
+  $('fortuneScroll').classList.add('show');
+}
+
+// ════════════════════════════════
+//  CHALLENGE
+// ════════════════════════════════
+const JSONBIN_URL='https://api.jsonbin.io/v3/b/69bad240aa77b81da9f79ce8';
+const JSONBIN_KEY='$2a$10$QP1Z/K.tq/DmdccfofkC0evnDlkYuELZuuyr.TAZVnd9EIX5SMhha';
+const QOD_PW='Qosa_23Gs';
+
+function getQodAnswerKey(){return`qod_answer_${todayStr()}`;}
+function initChallenge(){updateStreak();loadQuestion();}
+function updateStreak(){
+  const s=JSON.parse(localStorage.getItem('qod_streak_v2')||'{"count":0}');
+  $('streakCount').textContent=s.count||0;
+  $('streakBadge').textContent=(s.count||0)+' дней';
+  $('streakSub').textContent=s.count>0?'Не прерывай серию!':'отвечай каждый день';
+}
+async function loadQuestion(){
+  show('qodLoading','flex');hide('qodEmpty');hide('qodCard');
+  try{
+    const r=await fetch(JSONBIN_URL+'/latest',{headers:{'X-Master-Key':JSONBIN_KEY}});
+    if(!r.ok)throw new Error();
+    const data=(await r.json()).record||null;
+    hide('qodLoading');
+    if(!data||data.dateKey!==todayStr()){show('qodEmpty','block');return;}
+    renderQuestion(data);
+  }catch(e){hide('qodLoading');show('qodEmpty','block');}
+}
+function renderQuestion(data){
+  show('qodCard','block');
+  $('challengeDayLabel').textContent=todayLabel();
+  $('qodCategory').textContent=data.category||'';
+  $('challengeText').textContent=data.question||'';
+  const L=['А','Б','В','Г'],opts=$('qodOptions');
+  opts.innerHTML='';
+  const saved=localStorage.getItem(getQodAnswerKey()),chosen=saved!==null?parseInt(saved):null;
+  (data.options||[]).forEach((opt,i)=>{
+    const btn=document.createElement('button');btn.className='qod-opt';
+    btn.innerHTML=`<span class="qod-letter">${L[i]}</span><span>${opt}</span>`;
+    if(chosen!==null){btn.disabled=true;if(i===data.correct)btn.classList.add(chosen===i?'correct':'other-correct');else if(i===chosen)btn.classList.add('wrong');}
+    else btn.onclick=()=>answerQ(i,data);
+    opts.appendChild(btn);
+  });
+  if(chosen!==null)showQodResult(chosen===data.correct,data.explanation,data.options[data.correct]);
+}
+function answerQ(chosen,data){
+  document.querySelectorAll('.qod-opt').forEach((b,i)=>{b.disabled=true;if(i===data.correct)b.classList.add(chosen===i?'correct':'other-correct');else if(i===chosen)b.classList.add('wrong');});
+  localStorage.setItem(getQodAnswerKey(),String(chosen));
+  if(chosen===data.correct){
+    const r=localStorage.getItem('qod_streak_v2'),s=r?JSON.parse(r):{count:0,lastDay:null};
+    const today=todayStr(),d2=new Date();d2.setDate(d2.getDate()-1);
+    const y=`${d2.getFullYear()}_${d2.getMonth()}_${d2.getDate()}`;
+    s.count=(s.lastDay===y)?s.count+1:1;s.lastDay=today;
+    localStorage.setItem('qod_streak_v2',JSON.stringify(s));
+    if(window._fbSaveStreak)_fbSaveStreak(s);
+  }
+  showQodResult(chosen===data.correct,data.explanation,data.options[data.correct]);
+  updateStreak();
+  setTimeout(()=>initAchievements(),400);
+}
+function showQodResult(ok,exp,correct){
+  const r=$('qodResult');r.style.display='block';
+  $('qodResultIcon').textContent=ok?'🎉':'😔';
+  const t=$('qodResultTitle');t.textContent=ok?'Правильно!':'Неверно';t.className='qod-result-title '+(ok?'correct':'wrong');
+  $('qodExplanation').innerHTML=exp?`<em>Правильный ответ:</em> ${correct}<br><br>${exp}`:`<em>Правильный ответ:</em> ${correct}`;
+}
+function openAdminPanel(){
+  const pw=prompt('Пароль организатора:');if(pw!==QOD_PW){if(pw!==null)showToast('Неверный пароль','error');return;}
+  show('adminModal','flex');selCorrect(0);
+}
+function closeAdmin(){hide('adminModal');}
+function selCorrect(idx){
+  window._ci=idx;
+  [0,1,2,3].forEach(i=>{const b=$('cb'+i);if(!b)return;b.style.background=i===idx?'var(--cyan)':'var(--surface)';b.style.borderColor=i===idx?'var(--cyan)':'var(--border)';b.style.color=i===idx?'#000':'var(--muted)';});
+}
+async function saveAdminQ(){
+  const cat=$('adminCategory').value.trim(),q=$('adminQuestion').value.trim();
+  const opts=[0,1,2,3].map(i=>$('adminOpt'+i).value.trim());
+  const exp=$('adminExplanation').value.trim(),correct=window._ci??0;
+  if(!q)return showToast('Введите вопрос','error');
+  if(opts.some(o=>!o))return showToast('Заполните все 4 варианта','error');
+  const btn=$('adminSaveBtn'),st=$('adminStatus');btn.disabled=true;btn.textContent='⏳ Сохраняем...';
+  try{
+    const r=await fetch(JSONBIN_URL,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':JSONBIN_KEY},body:JSON.stringify({category:cat,question:q,options:opts,correct,explanation:exp,dateKey:todayStr()})});
+    if(!r.ok)throw new Error('save failed');
+    showToast('✓ Опубликовано!','success');closeAdmin();loadQuestion();
+  }catch(e){st.style.color='var(--orange)';st.textContent='⚠️ '+e.message;btn.disabled=false;btn.textContent='✓ Опубликовать';}
+}
+
+// ════════════════════════════════
+//  ACHIEVEMENTS
+// ════════════════════════════════
+const ACHIEVEMENTS=[
+  {id:'qod1', group:'qod', icon:'🎯',name:'Первый ответ',check:()=>getQodStreak()>=1},
+  {id:'qod3', group:'qod', icon:'🔥',name:'3 дня',       check:()=>getQodStreak()>=3},
+  {id:'qod7', group:'qod', icon:'🌟',name:'7 дней',      check:()=>getQodStreak()>=7},
+  {id:'qod14',group:'qod', icon:'👑',name:'2 недели',    check:()=>getQodStreak()>=14},
+  {id:'ft1',  group:'fort',icon:'🥠',name:'Первое',      check:()=>getFortDays()>=1},
+  {id:'ft3',  group:'fort',icon:'🌙',name:'3 ночи',      check:()=>getFortDays()>=3},
+  {id:'ft7',  group:'fort',icon:'✨',name:'7 дней',      check:()=>getFortDays()>=7},
+  {id:'rpg1', group:'rpg', icon:'⚔️',name:'Герой',       check:()=>!!loadChar()},
+  {id:'rpg5', group:'rpg', icon:'🗡️',name:'Ур. 5+',      check:()=>{const c=loadChar();return c&&calcLvl(c.xp)>=5;}},
+  {id:'rpg50',group:'rpg', icon:'💎',name:'50 XP',       check:()=>{const c=loadChar();return c&&c.xp>=50;}},
+  {id:'s1',   group:'sec', icon:'🎪',name:'???',         check:()=>getQodStreak()>=1&&getFortDays()>=1&&!!loadChar()},
+  {id:'s2',   group:'sec', icon:'🦄',name:'???',         check:()=>getQodStreak()>=3&&getFortDays()>=3},
+  {id:'s3',   group:'sec', icon:'🌈',name:'???',         check:()=>getQodStreak()>=7&&getFortDays()>=7},
+  // ── Вопрос дня ──
+  {id:'qod21',group:'qod', icon:'🚀',name:'3 недели',     check:()=>getQodStreak()>=21},
+  {id:'qod30',group:'qod', icon:'🏆',name:'Месяц!',       check:()=>getQodStreak()>=30},
+  // ── Предсказания ──
+  {id:'ft14', group:'fort',icon:'🌠',name:'2 недели',     check:()=>getFortDays()>=14},
+  {id:'ft30', group:'fort',icon:'🔮',name:'Месяц',        check:()=>getFortDays()>=30},
+  // ── RPG ──
+  {id:'rpg10',group:'rpg', icon:'🌀',name:'Ур. 10+',      check:()=>{const c=loadChar();return c&&calcLvl(c.xp)>=10;}},
+  {id:'rpg3', group:'rpg', icon:'📅',name:'3 события',    check:()=>{let n=0;for(let i=0;i<localStorage.length;i++)if(localStorage.key(i).startsWith('rpg_ev_'))n++;return n>=3;}},
+  {id:'rpg7', group:'rpg', icon:'🗓️',name:'7 событий',   check:()=>{let n=0;for(let i=0;i<localStorage.length;i++)if(localStorage.key(i).startsWith('rpg_ev_'))n++;return n>=7;}},
+  {id:'rpg200',group:'rpg',icon:'⚡',name:'200 XP',       check:()=>{const c=loadChar();return c&&c.xp>=200;}},
+  {id:'rpg500',group:'rpg',icon:'🌟',name:'500 XP',       check:()=>{const c=loadChar();return c&&c.xp>=500;}},
+  // ── Секретные ──
+  {id:'s4',   group:'sec', icon:'🔥',name:'???',          check:()=>getQodStreak()>=14&&getFortDays()>=14&&!!loadChar()},
+  {id:'s5',   group:'sec', icon:'👾',name:'???',          check:()=>{const c=loadChar();let ev=0;for(let i=0;i<localStorage.length;i++)if(localStorage.key(i).startsWith('rpg_ev_'))ev++;return ev>=7&&c&&c.xp>=200;}},
+];
+function getQodStreak(){const r=localStorage.getItem('qod_streak_v2');return r?(JSON.parse(r).count||0):0;}
+function getFortDays(){let c=0;for(let i=0;i<localStorage.length;i++)if(localStorage.key(i).startsWith('fortune_'))c++;return c;}
+
+function initAchievements(){renderAchievements();}
+function renderAchievements(){
+  const groups={qod:[],fort:[],rpg:[],sec:[]};
+  const savedU=JSON.parse(localStorage.getItem('ach_unlocked')||'[]');
+  const savedN=JSON.parse(localStorage.getItem('ach_new')||'[]');
+  const newU=[];
+  ACHIEVEMENTS.forEach(a=>{
+    let u=savedU.includes(a.id);
+    if(!u){try{u=a.check();}catch(e){u=false;}if(u){savedU.push(a.id);newU.push(a.id);}}
+    groups[a.group].push({...a,unlocked:u});
+  });
+  if(newU.length){
+    localStorage.setItem('ach_unlocked',JSON.stringify(savedU));
+    const an=[...new Set([...savedN,...newU])];
+    localStorage.setItem('ach_new',JSON.stringify(an));
+    if(window._fbSaveAch)_fbSaveAch(savedU);
+    newU.forEach(id=>{const a=ACHIEVEMENTS.find(x=>x.id===id);if(a)showToast('🏅 '+a.name,'success');});
+  }
+  const seenN=JSON.parse(localStorage.getItem('ach_new')||'[]');
+  const rg=(gid,items)=>{
+    const el=$(gid);if(!el)return;
+    el.innerHTML=items.map(a=>{
+      const isNew=seenN.includes(a.id)&&a.unlocked,sl=a.group==='sec'&&!a.unlocked;
+      return`<div class="ach-card ${a.unlocked?'unlocked':'locked'}">
+        ${isNew?'<div class="ach-new">NEW</div>':''}
+        <span class="ach-icon">${sl?'❓':a.icon}</span>
+        <div class="ach-name">${sl?'???':a.name}</div>
+        <div style="font-size:9px;color:${a.unlocked?'#f59e0b':'rgba(255,255,255,.2)'};margin-top:3px;font-family:Inter,sans-serif;">${a.unlocked?'✓ открыто':'🔒'}</div>
+      </div>`;
+    }).join('');
+  };
+  rg('achGridFortune',groups.fort);rg('achGridRPG',groups.rpg);rg('achGridSecret',groups.sec);
+  const total=ACHIEVEMENTS.length,unlocked=savedU.length;
+  $('achUnlockedCount').textContent=unlocked;$('achTotalCount').textContent=total;
+  setTimeout(()=>localStorage.removeItem('ach_new'),3000);
+  updateAchBadge();
+}
+function updateAchBadge(){
+  const u=JSON.parse(localStorage.getItem('ach_unlocked')||'[]').length;
+  const el=$('achBadge');if(el)el.textContent=u>0?`Открыто ${u} из ${ACHIEVEMENTS.length} наград`:'Открывай значки за серии и секреты';
+}
+
+// ════════════════════════════════
+//  RPG
+// ════════════════════════════════
+const RPG_EVENTS=[
+  {id:'e1',type:'team',emoji:'🤝',typeName:'🤝 Командная работа',
+   text:'Твоя команда застряла на проекте — у всех разные идеи и никто не может договориться. До презентации 2 часа.',
+   choices:[
+    {text:'Взять инициативу, предложить голосование и двигаться дальше',stat:'leadership',   delta:2,xp:25,result:'Команда оценила решительность. +2 Лидерство'},
+    {text:'Выслушать каждого и найти компромиссное решение',             stat:'communication',delta:2,xp:20,result:'Все остались довольны. +2 Коммуникация'},
+    {text:'Предложить нестандартный подход, объединяющий идеи',          stat:'creativity',   delta:2,xp:22,result:'Команда вдохновилась! +2 Креативность'},
+  ]},
+  {id:'e2',type:'pitch',emoji:'💡',typeName:'💡 Защита идеи',
+   text:'На питч-сессии эксперт жёстко критикует твой проект. Остальные участники ждут твоей реакции.',
+   choices:[
+    {text:'Спокойно и аргументированно ответить на каждое замечание',stat:'leadership',      delta:3,xp:30,result:'Эксперты впечатлены уверенностью. +3 Лидерство'},
+    {text:'Признать слабые стороны и предложить улучшения прямо сейчас',stat:'responsibility',delta:2,xp:25,result:'Честность подкупила жюри. +2 Ответственность'},
+    {text:'Переосмыслить критику и найти в ней скрытую возможность',    stat:'creativity',   delta:3,xp:28,result:'Нестандартный взгляд удивил всех. +3 Креативность'},
+  ]},
+  {id:'e3',type:'network',emoji:'🌐',typeName:'🌐 Нетворкинг',
+   text:'На вечернем мероприятии ты видишь эксперта, которого давно хотел встретить. Он явно занят разговором.',
+   choices:[
+    {text:'Дождаться паузы и смело подойти представиться',              stat:'communication',delta:2,xp:20,result:'Завязался отличный разговор! +2 Коммуникация'},
+    {text:'Попросить общего знакомого представить вас',                  stat:'leadership',   delta:1,xp:15,result:'Знакомство состоялось. +1 Лидерство'},
+    {text:'Оставить контакты с кратким описанием проекта',              stat:'creativity',   delta:2,xp:18,result:'Эксперт сам написал первым! +2 Креативность'},
+  ]},
+  {id:'e4',type:'conflict',emoji:'⚡',typeName:'⚡ Конфликт',
+   text:'Участник соседней команды обвиняет тебя в том, что вы "украли" их идею. При всех.',
+   choices:[
+    {text:'Публично объяснить хронологию и доказать независимость',stat:'leadership',     delta:2,xp:25,result:'Ситуация разрешена. +2 Лидерство'},
+    {text:'Предложить объединить усилия и сделать проект вместе',   stat:'communication',  delta:3,xp:30,result:'Конкурент стал союзником! +3 Коммуникация'},
+    {text:'Признать совпадение и подчеркнуть уникальность подхода', stat:'responsibility', delta:2,xp:22,result:'Зрелая реакция произвела впечатление. +2 Ответственность'},
+  ]},
+  {id:'e5',type:'project',emoji:'📋',typeName:'📋 Участие в проекте',
+   text:'Тебе предлагают возглавить проект, но ты не уверен в своих силах. Дедлайн — через неделю.',
+   choices:[
+    {text:'Принять вызов и сразу распределить задачи в команде',           stat:'leadership',    delta:3,xp:30,result:'Ты справился лучше, чем ожидал! +3 Лидерство'},
+    {text:'Согласиться, но честно сказать команде о своих сомнениях',       stat:'responsibility',delta:2,xp:25,result:'Команда сплотилась вокруг тебя. +2 Ответственность'},
+    {text:'Предложить необычный формат проекта, который упростит задачу',   stat:'creativity',    delta:3,xp:28,result:'Инновационный подход сработал! +3 Креативность'},
+  ]},
+  {id:'e6',type:'speech',emoji:'🎤',typeName:'🎤 Выступление',
+   text:'За 10 минут до выступления ты узнаёшь, что отведённое время сократили вдвое.',
+   choices:[
+    {text:'Быстро сократить до ключевых тезисов и уверенно выйти',         stat:'leadership',   delta:2,xp:25,result:'Чёткость и уверенность — публика в восторге. +2 Лидерство'},
+    {text:'Сделать акцент на эмоциональной истории вместо деталей',         stat:'communication',delta:3,xp:28,result:'История зацепила зал! +3 Коммуникация'},
+    {text:'Превратить ограничение в фишку — начать с самого важного',       stat:'creativity',   delta:2,xp:22,result:'Нестандартная структура запомнилась. +2 Креативность'},
+  ]},
+  {id:'e7',type:'opportunity',emoji:'🌟',typeName:'🌟 Возможность',
+   text:'Известный спикер форума просит тебя помочь с организацией его сессии прямо сейчас.',
+   choices:[
+    {text:'Взяться за задачу и быстро всё организовать',      stat:'responsibility',delta:3,xp:30,result:'Спикер запомнил тебя. +3 Ответственность'},
+    {text:'Собрать команду и разделить задачи',                stat:'leadership',   delta:2,xp:25,result:'Командная работа сработала. +2 Лидерство'},
+    {text:'Предложить улучшение к формату прямо сейчас',       stat:'creativity',   delta:2,xp:22,result:'Спикер взял идею на заметку! +2 Креативность'},
+  ]},
+  {id:'e8',type:'mentor',emoji:'🧙',typeName:'🧙 Наставник',
+   text:'После лекции куратор предлагает тебе стать ментором для новичков в твоей группе.',
+   choices:[
+    {text:'Согласиться и составить план поддержки команды',         stat:'leadership',   delta:3,xp:30,result:'Новички сказали, что именно ты им помог! +3 Лидерство'},
+    {text:'Принять роль и честно предупредить о своих ограничениях',stat:'responsibility',delta:2,xp:22,result:'Твоя честность оценена. +2 Ответственность'},
+    {text:'Предложить формат взаимного наставничества',             stat:'communication',delta:3,xp:28,result:'Обмен опытом получился мощным! +3 Коммуникация'},
+   ]},
+  {id:'e9',type:'media',emoji:'📸',typeName:'📸 Медиа-момент',
+   text:'Корреспондент форума просит дать короткий комментарий на камеру о твоём проекте.',
+   choices:[
+    {text:'Дать уверенный комментарий с ключевыми тезисами',        stat:'leadership',   delta:2,xp:25,result:'Ролик набрал репосты. +2 Лидерство'},
+    {text:'Рассказать личную историю, которая стоит за проектом',   stat:'communication',delta:3,xp:28,result:'Зрители растрогались. +3 Коммуникация'},
+    {text:'Придумать неожиданный визуальный приём на ходу',         stat:'creativity',   delta:3,xp:30,result:'Ролик стал вирусным внутри форума! +3 Креативность'},
+   ]},
+  {id:'e10',type:'night',emoji:'🌙',typeName:'🌙 Ночной хакатон',
+   text:'До конца хакатона 3 часа, твоя команда выдохлась. Продукт сырой, но идея сильная.',
+   choices:[
+    {text:'Мотивировать команду и финально распределить задачи',    stat:'leadership',    delta:3,xp:32,result:'Финальный рывок удался! +3 Лидерство'},
+    {text:'Сфокусироваться на демо и срезать лишние фичи',          stat:'responsibility',delta:2,xp:25,result:'Чёткий MVP впечатлил жюри. +2 Ответственность'},
+    {text:'Переформатировать презентацию — продать идею, не код',   stat:'creativity',   delta:3,xp:30,result:'Жюри купили концепцию с первого слайда. +3 Креативность'},
+   ]},
+  {id:'e11',type:'feedback',emoji:'🔄',typeName:'🔄 Обратная связь',
+   text:'По итогам дня куратор даёт тебе жёсткую, но справедливую обратную связь наедине.',
+   choices:[
+    {text:'Поблагодарить и составить план улучшений прямо на месте',stat:'responsibility',delta:3,xp:28,result:'Куратор отметил твою зрелость. +3 Ответственность'},
+    {text:'Задать уточняющие вопросы, чтобы понять глубже',        stat:'communication',delta:2,xp:22,result:'Диалог оказался ценнее критики. +2 Коммуникация'},
+    {text:'Переосмыслить слабость как направление для прорыва',     stat:'creativity',   delta:3,xp:30,result:'Новый угол зрения изменил проект. +3 Креативность'},
+   ]},
+  {id:'e12',type:'volunteer',emoji:'🤲',typeName:'🤲 Помощь',
+   text:'Участник из другого региона потерялся и не знает расписания. Ты торопишься на сессию.',
+   choices:[
+    {text:'Отвести лично и опоздать на сессию',                        stat:'responsibility',delta:3,xp:25,result:'Участник не забудет этой помощи. +3 Ответственность'},
+    {text:'Объяснить маршрут и найти кого-то рядом, кто проводит',    stat:'leadership',   delta:2,xp:20,result:'Быстрое решение — все довольны. +2 Лидерство'},
+    {text:'Написать в общий чат и найти ему сразу пять помощников',   stat:'communication',delta:3,xp:28,result:'Ты объединил форум вокруг одного человека. +3 Коммуникация'},
+   ]},
+  {id:'e13',type:'decision',emoji:'⚖️',typeName:'⚖️ Сложный выбор',
+   text:'Твоя команда разделилась: половина хочет радикально изменить проект, половина — оставить как есть. Голосование 2:2.',
+   choices:[
+    {text:'Использовать право решающего голоса и взять ответственность', stat:'leadership',    delta:3,xp:30,result:'Решение оказалось правильным. +3 Лидерство'},
+    {text:'Предложить прототип обеих версий и выбрать по результату',   stat:'creativity',    delta:3,xp:28,result:'Команда убедилась на практике. +3 Креативность'},
+    {text:'Найти третий путь, объединяющий оба подхода',                stat:'communication', delta:2,xp:25,result:'Компромисс стал сильнее каждой из идей. +2 Коммуникация'},
+   ]},
+  {id:'e14',type:'crisis',emoji:'🚨',typeName:'🚨 Кризис',
+   text:'За час до финальной презентации сломался ноутбук с вашими материалами. Облако не синхронизировалось.',
+   choices:[
+    {text:'Быстро восстановить ключевые слайды по памяти',          stat:'responsibility',delta:3,xp:30,result:'Кризис преодолён, команда вдохновлена. +3 Ответственность'},
+    {text:'Попросить помощи у организаторов и соседних команд',     stat:'communication', delta:2,xp:22,result:'Форум выручил — всё получилось. +2 Коммуникация'},
+    {text:'Выступить без слайдов — сделать ставку на живой рассказ', stat:'creativity',   delta:3,xp:35,result:'Без слайдов выступление получилось сильнее. +3 Креативность'},
+   ]},
+  {id:'e15',type:'inspiration',emoji:'✨',typeName:'✨ Вдохновение',
+   text:'На мастер-классе тебя осеняет идея, которая может полностью изменить твой проект. До презентации — завтра.',
+   choices:[
+    {text:'Поднять руку и поделиться идеей прямо сейчас',             stat:'leadership',    delta:2,xp:22,result:'Эксперт назвал идею перспективной. +2 Лидерство'},
+    {text:'Записать и ночью переработать проект',                      stat:'responsibility',delta:3,xp:28,result:'Ночной труд окупился — проект ожил. +3 Ответственность'},
+    {text:'Собрать команду после мастер-класса и быстро протестировать',stat:'creativity',   delta:3,xp:30,result:'Прототип убедил команду за 20 минут. +3 Креативность'},
+   ]},
+  {id:'e16',type:'debate',emoji:'🗣️',typeName:'🗣️ Дебаты',
+   text:'На открытой дискуссии ты не согласен с мнением известного эксперта. Зал смотрит на тебя.',
+   choices:[
+    {text:'Чётко и уважительно изложить контраргументы',            stat:'leadership',    delta:3,xp:30,result:'Эксперт признал твою точку зрения весомой. +3 Лидерство'},
+    {text:'Задать уточняющий вопрос, который обнажает противоречие', stat:'communication', delta:3,xp:28,result:'Зал оценил интеллектуальную смелость. +3 Коммуникация'},
+    {text:'Предложить синтез двух точек зрения',                    stat:'creativity',    delta:2,xp:25,result:'Спор перерос в сотрудничество. +2 Креативность'},
+   ]},
+  {id:'e17',type:'recognition',emoji:'🏅',typeName:'🏅 Признание',
+   text:'Организаторы неожиданно называют тебя как пример лучшего участника дня перед всем форумом.',
+   choices:[
+    {text:'Поблагодарить команду — сказать, что это общая заслуга',  stat:'responsibility',delta:3,xp:28,result:'Команда тебя обожает. +3 Ответственность'},
+    {text:'Использовать момент и вдохновить других своей историей',  stat:'communication', delta:3,xp:30,result:'Несколько участников подошли за советом. +3 Коммуникация'},
+    {text:'Принять с достоинством и поставить новую амбициозную цель',stat:'leadership',   delta:2,xp:25,result:'Признание стало точкой старта. +2 Лидерство'},
+   ]},
+  {id:'e18',type:'experiment',emoji:'🔬',typeName:'🔬 Эксперимент',
+   text:'Куратор предлагает твоей команде протестировать совершенно новый формат работы, который никто ещё не пробовал.',
+   choices:[
+    {text:'Согласиться и первыми опробовать новый метод',            stat:'creativity',    delta:3,xp:30,result:'Эксперимент удался — метод взяли другие команды. +3 Креативность'},
+    {text:'Изучить риски и предложить модифицированную версию',      stat:'responsibility',delta:2,xp:25,result:'Взвешенный подход оценили организаторы. +2 Ответственность'},
+    {text:'Провести быстрый опрос команды перед согласием',          stat:'leadership',    delta:2,xp:22,result:'Команда почувствовала уважение к своему мнению. +2 Лидерство'},
+   ]},
+  {id:'e19',type:'energy',emoji:'⚡',typeName:'⚡ Усталость',
+   text:'Третий день форума. Команда на грани выгорания, а до финала ещё два события.',
+   choices:[
+    {text:'Объявить 15-минутный перерыв и провести мини-ритуал перезарядки', stat:'leadership',   delta:3,xp:28,result:'Команда вернулась с удвоенной энергией. +3 Лидерство'},
+    {text:'Честно поговорить о состоянии каждого и перераспределить нагрузку',stat:'communication',delta:3,xp:30,result:'Открытость сплотила команду. +3 Коммуникация'},
+    {text:'Найти в усталости топливо — напомнить команде, ради чего всё это', stat:'creativity',   delta:2,xp:25,result:'Мотивационный момент запомнится надолго. +2 Креативность'},
+   ]},
+  {id:'e20',type:'partnership',emoji:'🤜',typeName:'🤜 Партнёрство',
+   text:'Конкурирующая команда предлагает объединиться для совместного проекта. Это риск, но и возможность.',
+   choices:[
+    {text:'Согласиться и взять на себя роль координатора',           stat:'leadership',    delta:3,xp:30,result:'Объединённая команда вышла в финал. +3 Лидерство'},
+    {text:'Обсудить условия и зафиксировать договорённости',         stat:'responsibility',delta:3,xp:28,result:'Чёткие правила сделали союз надёжным. +3 Ответственность'},
+    {text:'Предложить нестандартную модель — каждая команда сохраняет свою идею',stat:'creativity',delta:2,xp:25,result:'Гибридный формат всех удивил. +2 Креативность'},
+   ]},
+  {id:'e21',type:'social',emoji:'🎉',typeName:'🎉 Социальный момент',
+   text:'На вечернем нетворкинге ты замечаешь, что один участник стоит в стороне и явно чувствует себя не в своей тарелке.',
+   choices:[
+    {text:'Подойти и представиться, втянуть в разговор',              stat:'communication', delta:3,xp:25,result:'Новый знакомый оказался интереснейшим человеком. +3 Коммуникация'},
+    {text:'Организовать общий круг знакомств вокруг себя',            stat:'leadership',    delta:2,xp:22,result:'Атмосфера стала теплее. +2 Лидерство'},
+    {text:'Придумать ледоколку — небольшую игру для соседних людей',  stat:'creativity',    delta:3,xp:28,result:'Вечер запомнился всем. +3 Креативность'},
+   ]},
+  {id:'e22',type:'planning',emoji:'📐',typeName:'📐 Планирование',
+   text:'Организаторы просят тебя составить план работы команды на завтра. У тебя 20 минут.',
+   choices:[
+    {text:'Быстро набросать чёткий таймлайн с ответственными',        stat:'responsibility',delta:3,xp:28,result:'Команда знает, что делать. +3 Ответственность'},
+    {text:'Провести мозговой штурм и выбрать лучший план вместе',     stat:'communication', delta:2,xp:22,result:'Каждый чувствует причастность к плану. +2 Коммуникация'},
+    {text:'Создать гибкий план с запасными вариантами',               stat:'creativity',    delta:2,xp:25,result:'Запасные варианты пригодились! +2 Креативность'},
+   ]},
+  {id:'e23',type:'integrity',emoji:'🛡️',typeName:'🛡️ Принципы',
+   text:'Ты узнаёшь, что победивший проект использовал данные сомнительного качества. Остальные этого не заметили.',
+   choices:[
+    {text:'Тихо сообщить организаторам без публичного скандала',      stat:'responsibility',delta:3,xp:32,result:'Организаторы оценили честность. +3 Ответственность'},
+    {text:'Поговорить напрямую с командой-победителем',               stat:'communication', delta:3,xp:28,result:'Команда исправила ошибку. +3 Коммуникация'},
+    {text:'Предложить новый стандарт проверки данных для форума',     stat:'creativity',    delta:2,xp:25,result:'Твоя инициатива вошла в регламент. +2 Креативность'},
+   ]},
+  {id:'e24',type:'tech',emoji:'💻',typeName:'💻 Технический вызов',
+   text:'Демо вашего продукта не работает из-за технического сбоя прямо перед жюри.',
+   choices:[
+    {text:'Спокойно объяснить идею словами, без демо',                stat:'communication', delta:3,xp:28,result:'Жюри оценило самообладание. +3 Коммуникация'},
+    {text:'Попросить 5 минут и исправить критическую ошибку',         stat:'responsibility',delta:2,xp:25,result:'Быстрое решение произвело впечатление. +2 Ответственность'},
+    {text:'Обыграть баг как фичу и рассмешить жюри',                 stat:'creativity',    delta:3,xp:30,result:'Жюри смеялось и запомнило проект. +3 Креативность'},
+   ]},
+  {id:'e25',type:'vision',emoji:'🔭',typeName:'🔭 Видение',
+   text:'Тебя просят за 2 минуты объяснить, как твой проект изменит мир через 10 лет.',
+   choices:[
+    {text:'Дать чёткий и амбициозный прогноз с цифрами',              stat:'leadership',    delta:3,xp:30,result:'Жюри запомнило масштаб идеи. +3 Лидерство'},
+    {text:'Рассказать историю конкретного человека, чья жизнь изменится',stat:'communication',delta:3,xp:28,result:'История тронула сердца. +3 Коммуникация'},
+    {text:'Нарисовать метафору — образный образ будущего',             stat:'creativity',    delta:2,xp:25,result:'Метафора осталась в памяти надолго. +2 Креативность'},
+   ]},
+  {id:'e26',type:'adaptation',emoji:'🦎',typeName:'🦎 Адаптация',
+   text:'Правила конкурса изменились прямо в день финала — формат стал совершенно другим.',
+   choices:[
+    {text:'Быстро переориентировать команду и не паниковать',         stat:'leadership',    delta:3,xp:32,result:'Команда была благодарна за спокойствие. +3 Лидерство'},
+    {text:'Найти, что в новых правилах играет тебе на руку',          stat:'creativity',    delta:3,xp:30,result:'Изменения оказались возможностью. +3 Креативность'},
+    {text:'Уточнить все детали у организаторов — не угадывать',       stat:'responsibility',delta:2,xp:22,result:'Точное понимание правил дало преимущество. +2 Ответственность'},
+   ]},
+  {id:'e27',type:'mentorship',emoji:'🌱',typeName:'🌱 Рост',
+   text:'Младший участник просит тебя разобрать его идею. Ты устал, но видишь в ней потенциал.',
+   choices:[
+    {text:'Уделить час и детально разобрать идею',                    stat:'responsibility',delta:3,xp:28,result:'Участник улучшил проект и упомянул тебя в благодарностях. +3 Ответственность'},
+    {text:'Задать три ключевых вопроса, которые помогут ему самому найти ответы',stat:'communication',delta:3,xp:30,result:'Он нашёл решение сам — это лучший результат. +3 Коммуникация'},
+    {text:'Предложить краш-тест — попросить защитить идею за 60 секунд',stat:'creativity',  delta:2,xp:25,result:'Упражнение прояснило идею мгновенно. +2 Креативность'},
+   ]},
+  {id:'e28',type:'presence',emoji:'🧘',typeName:'🧘 Момент здесь и сейчас',
+   text:'Среди напряжённого дня ты вдруг понимаешь, что совершенно не помнишь последние два часа — действовал на автопилоте.',
+   choices:[
+    {text:'Сделать паузу, выдохнуть и осознанно расставить приоритеты',stat:'responsibility',delta:2,xp:22,result:'Ясность ума вернулась. +2 Ответственность'},
+    {text:'Поговорить с командой — может, и они на автопилоте?',       stat:'communication', delta:3,xp:25,result:'Синхронизация сделала работу эффективнее. +3 Коммуникация'},
+    {text:'Придумать мини-ритуал осознанности для всей команды',       stat:'creativity',    delta:3,xp:28,result:'Ритуал прижился и стал традицией команды. +3 Креативность'},
+   ]},
+  {id:'e29',type:'legacy',emoji:'🏛️',typeName:'🏛️ Наследие',
+   text:'В последний день форума тебя просят написать одно послание следующему потоку участников.',
+   choices:[
+    {text:'Написать честное письмо о том, что узнал о себе',          stat:'responsibility',delta:3,xp:30,result:'Письмо стало самым цитируемым. +3 Ответственность'},
+    {text:'Дать три практических совета, которые реально помогут',    stat:'leadership',    delta:2,xp:25,result:'Следующий поток сказал спасибо. +2 Лидерство'},
+    {text:'Создать метафору или образ, который вдохновит будущих участников',stat:'creativity',delta:3,xp:32,result:'Образ разошёлся по соцсетям. +3 Креативность'},
+   ]},
+  {id:'e30',type:'finale',emoji:'🚀',typeName:'🚀 Финальный рывок',
+   text:'Последние часы форума. Ты можешь сделать ещё одно действие, которое запомнят все.',
+   choices:[
+    {text:'Организовать спонтанное общее фото всего потока',           stat:'communication', delta:3,xp:35,result:'Снимок стал символом этого форума. +3 Коммуникация'},
+    {text:'Публично поблагодарить людей, которые помогали тебе',       stat:'responsibility',delta:3,xp:30,result:'Слова тронули до слёз. +3 Ответственность'},
+    {text:'Предложить финальный челлендж — кто сделает самый смелый шаг?',stat:'leadership',delta:3,xp:32,result:'Финальный челлендж взорвал атмосферу. +3 Лидерство'},
+   ]},
+];
+
+const LEVEL_TITLES=['Новичок','Активист','Проектор','Лидер','Эксперт','Легенда Машука'];
+const XP_TABLE=[0,50,150,300,500,800];
+const ROLE_NAMES={participant:'🎓 Участник',volunteer:'🤝 Волонтёр'};
+
+let rpgRole='participant',rpgStatPts={leadership:1,creativity:1,communication:1,responsibility:1};
+
+function loadChar(){try{const r=localStorage.getItem('rpg_char');return r?JSON.parse(r):null;}catch(e){return null;}}
+function saveChar(c){
+  // Validate before saving to prevent XP manipulation
+  if(!c||typeof c!=='object')return;
+  const XP_TABLE=[0,50,150,300,500,800];
+  let expectedLevel=1;
+  for(let i=XP_TABLE.length-1;i>=0;i--)if(c.xp>=XP_TABLE[i]){expectedLevel=i+1;break;}
+  // Force correct level (can't be manipulated)
+  c.level=expectedLevel;
+  // Clamp XP (can't exceed max)
+  c.xp=Math.max(0,Math.min(2000,Math.floor(c.xp)));
+  // Clamp stats
+  ['leadership','creativity','communication','responsibility'].forEach(s=>{
+    if(typeof c.stats[s]==='number') c.stats[s]=Math.max(1,Math.min(30,Math.floor(c.stats[s])));
+  });
+  localStorage.setItem('rpg_char',JSON.stringify(c));
+  localStorage.removeItem('rpg_reset');
+  if(window._fbSaveRPG) _fbSaveRPG(c);
+}
+function calcLvl(xp){for(let i=XP_TABLE.length-1;i>=0;i--)if(xp>=XP_TABLE[i])return i+1;return 1;}
+
+function initRPG(){
+  const c=loadChar();
+  if(!c){
+    show('rpgCreate','block');hide('rpgMain');
+    rpgStatPts={leadership:1,creativity:1,communication:1,responsibility:1};
+    rpgRole='participant';
+    updateStatUI();
+  }else{
+    hide('rpgCreate');show('rpgMain','block');
+    renderCharCard(c);
+    loadTodayEvent(c);
+    loadLeaderboard(c);
+  }
+  updateRPGBadge();
+}
+
+function selectRole(role,idx){
+  rpgRole=role;
+  document.querySelectorAll('.role-btn').forEach((b,i)=>b.classList.toggle('active',i===idx));
+}
+function chStat(stat,delta){
+  const used=Object.values(rpgStatPts).reduce((a,b)=>a+b,0)-4,left=10-used;
+  if(delta>0&&left<=0)return;if(delta<0&&rpgStatPts[stat]<=1)return;
+  rpgStatPts[stat]+=delta;updateStatUI();
+}
+function updateStatUI(){
+  const used=Object.values(rpgStatPts).reduce((a,b)=>a+b,0)-4;
+  $('rpgPtsLeft').textContent=10-used;
+  ['leadership','creativity','communication','responsibility'].forEach(s=>{const e=$('sv-'+s);if(e)e.textContent=rpgStatPts[s];});
+}
+
+function createChar(){
+  const name=$('rpgCharName').value.trim();
+  if(!name)return showToast('Введи имя персонажа','error');
+  const bonus=rpgRole==='volunteer'?{communication:2}:{leadership:2};
+  const stats={...rpgStatPts};
+  Object.entries(bonus).forEach(([k,v])=>stats[k]=(stats[k]||0)+v);
+  const c={name,role:rpgRole,stats,xp:0,level:1,avatar:selectedAvatar,created:Date.now()};
+  saveChar(c);
+  hide('rpgCreate');show('rpgMain','block');
+  renderCharCard(c);loadTodayEvent(c);loadLeaderboard(c);
+  updateRPGBadge();updateAchBadge();
+  showToast('⚔️ Персонаж создан! Вперёд, '+name,'success');
+}
+
+function renderCharCard(c){
+  const lvl=calcLvl(c.xp);
+  const xpCurr=c.xp-XP_TABLE[lvl-1];
+  const xpNeed=(XP_TABLE[lvl]||XP_TABLE[lvl-1]+500)-XP_TABLE[lvl-1];
+  const pct=Math.min(100,Math.round(xpCurr/xpNeed*100));
+  $('charAvatarSVG').textContent=c.avatar||'🧑‍🎓';
+  $('charLevelBadge').textContent=lvl;
+  $('charName').textContent=c.name;
+  $('charRole').textContent=ROLE_NAMES[c.role]||'';
+  $('charTitle').textContent=(LEVEL_TITLES[lvl-1]||'Легенда')+' · '+c.xp+' XP';
+  $('xpFill').style.width=pct+'%';
+  $('xpCurrent').textContent=xpCurr;$('xpNext').textContent=xpNeed;
+  ['leadership','creativity','communication','responsibility'].forEach(s=>{const e=$('cs-'+s);if(e)e.textContent=c.stats[s]||1;});
+}
+
+function loadTodayEvent(c){
+  const loadEl=$('eventLoading'),cardEl=$('eventCard'),doneEl=$('eventDone');
+  loadEl.classList.add('show');hide('eventCard');hide('eventDone');
+  setTimeout(()=>{
+    loadEl.classList.remove('show');
+    const key='rpg_ev_'+todayStr(),saved=localStorage.getItem(key);
+    if(saved){const d=JSON.parse(saved);showEventDone(d.result);return;}
+    const d=new Date(),_dateNum2=d.getFullYear()*10000+(d.getMonth()+1)*100+d.getDate();
+    const _ruid=(typeof _getUID==='function'?_getUID():null)||'guest';
+    const _rhash=_ruid.split('').reduce((a,c)=>a+c.charCodeAt(0),0);
+    const seed=_dateNum2*31+_rhash;
+    const idx=rng(seed)%RPG_EVENTS.length;
+    renderEvent(RPG_EVENTS[idx],c);
+  },900);
+}
+
+function renderEvent(ev,c){
+  show('eventCard','block');
+  $('eventPixelWrap').textContent=ev.emoji||'📋';
+  $('eventType').textContent=ev.typeName;
+  $('eventDay').textContent='День форума · '+todayLabel();
+  $('eventText').textContent=ev.text;
+  const el=$('eventChoices');el.innerHTML='';
+  const L=['А','Б','В'];
+  ev.choices.forEach((ch,i)=>{
+    const btn=document.createElement('button');btn.className='choice-btn';
+    btn.innerHTML=`<span class="choice-letter">${L[i]}</span><span>${ch.text}</span>`;
+    btn.onclick=()=>makeChoice(ev,ch,btn,el,c);
+    el.appendChild(btn);
+  });
+}
+
+function makeChoice(ev,ch,btn,el,c){
+  el.querySelectorAll('.choice-btn').forEach(b=>{b.disabled=true;b.style.opacity=b===btn?'1':'.38';});
+  btn.classList.add('selected');
+  // ANTI-CHEAT: verify xp/delta are within allowed bounds from the event definition
+  const safeXP = Math.max(0, Math.min(35, Math.floor(Number(ch.xp)||0)));
+  const safeDelta = Math.max(0, Math.min(5, Math.floor(Number(ch.delta)||0)));
+  const safeStat = ['leadership','creativity','communication','responsibility'].includes(ch.stat) ? ch.stat : 'leadership';
+  c.stats[safeStat]=(c.stats[safeStat]||1)+safeDelta;
+  c.xp+=safeXP;c.level=calcLvl(c.xp);
+  saveChar(c);
+  const res=document.createElement('div');res.className='choice-result';res.textContent='🌟 '+ch.result+' · +'+ch.xp+' XP';btn.after(res);
+  localStorage.setItem('rpg_ev_'+todayStr(),JSON.stringify({eventId:ev.id,result:ch.result}));
+  setTimeout(()=>{showEventDone(ch.result);renderCharCard(c);loadLeaderboard(c);updateRPGBadge();updateAchBadge();showToast('+'+ch.xp+' XP!','success');initAchievements();},2200);
+}
+
+function showEventDone(result){
+  hide('eventCard');show('eventDone','block');
+  $('doneResult').textContent=result||'Событие завершено';
+}
+
+async function loadLeaderboard(myChar){
+  const lb=$('lbRows');
+  let players=[];
+  if(window._fbGetLeaderboard){try{players=await _fbGetLeaderboard();}catch(e){}}
+  // Добавляем себя если нет в списке
+  const myName=myChar?myChar.name:null;
+  const hasMe=players.some(p=>p.name===myName);
+  if(myChar&&!hasMe)players.push({...myChar,isMe:true});
+  players.sort((a,b)=>b.xp-a.xp);
+  const medals=['gold','silver','bronze'];
+  lb.innerHTML=players.slice(0,10).map((p,i)=>{
+    const rank=i===0?'🥇':i===1?'🥈':i===2?'🥉':'#'+(i+1);
+    const rankClass=medals[i]||'';
+    const isMe=p.isMe||p.name===myName;
+    const lvl=calcLvl(p.xp);
+    return`<div class="lb-row${isMe?' me':''}">
+      <div class="lb-rank ${rankClass}">${rank}</div>
+      <div class="lb-ava">${p.avatar||'🧑‍🎓'}</div>
+      <div class="lb-info"><div class="lb-name">${p.name}${isMe?' (ты)':''}</div><div class="lb-role">${ROLE_NAMES[p.role]||''} · Ур.${lvl}</div></div>
+      <div class="lb-xp">${p.xp} XP</div>
+    </div>`;
+  }).join('')||'<div style="text-align:center;padding:20px;color:var(--muted);font-size:12px;">Стань первым в рейтинге!</div>';
+}
+
+function resetChar(){
+  if(!confirm('Сбросить персонажа? Весь прогресс будет потерян.'))return;
+  localStorage.setItem('rpg_reset','1');
+  localStorage.removeItem('rpg_char');
+  for(let i=localStorage.length-1;i>=0;i--){
+    const k=localStorage.key(i);
+    if(k&&k.startsWith('rpg_ev_'))localStorage.removeItem(k);
+  }
+  if(window._fbDeleteRPG)_fbDeleteRPG();
+  hide('rpgMain');show('rpgCreate','block');
+  rpgStatPts={leadership:1,creativity:1,communication:1,responsibility:1};
+  rpgRole='participant';updateStatUI();
+  $('rpgCharName').value='';updateRPGBadge();
+}
+
+function updateRPGBadge(){
+  const c=loadChar(),el=$('rpgBadge');if(!el)return;
+  if(c){const lvl=calcLvl(c.xp);el.textContent=c.name+' · Уровень '+lvl+' · '+c.xp+' XP';}
+  else el.textContent='Создай персонажа и прокачивай навыки';
+}
+
+// ── Share ──
+function openShareModal(){
+  const c=loadChar();if(!c)return;
+  const lvl=calcLvl(c.xp);
+  $('sharePixelAvatar').textContent=c.avatar||'🧑‍🎓';
+  $('sharePixelAvatar').style.fontSize='52px';
+  $('shareNameTxt').textContent=c.name;
+  $('shareRoleTxt').textContent=ROLE_NAMES[c.role]||'';
+  $('shareLevelTxt').textContent='Уровень '+lvl+' · '+c.xp+' XP · '+(LEVEL_TITLES[lvl-1]||'');
+  const icons={leadership:'👑',creativity:'🎨',communication:'💬',responsibility:'✅'};
+  $('shareStatsPills').innerHTML=Object.entries(c.stats).map(([k,v])=>`<span class="share-stat-pill">${icons[k]||''}${v}</span>`).join('');
+  $('shareModal').classList.add('show');
+}
+function closeShareModal(){$('shareModal').classList.remove('show');}
+function copyShare(){
+  const c=loadChar();if(!c)return;
+  const lvl=calcLvl(c.xp);
+  const icons={leadership:'👑',creativity:'🎨',communication:'💬',responsibility:'✅'};
+  const stats=Object.entries(c.stats).map(([k,v])=>icons[k]+v).join(' ');
+  const text=`⚔️ Мой герой форума МАШУК 17
+  ${c.name} · ${ROLE_NAMES[c.role]}
+  Уровень ${lvl} · ${c.xp} XP
+  ${stats}
+
+  🎮 Присоединяйся к игре →
+  https://mashuk17.gt.tc`;
+  navigator.clipboard.writeText(text).then(()=>{showToast('Скопировано!','success');closeShareModal();}).catch(()=>showToast('Ошибка копирования','error'));
+}
+
+// ════════════════════════════════
+//  FAQ
+// ════════════════════════════════
+// ════════════════════════════════
+//  FAQ — статические вопросы из HTML
+//  Вопросы редактируются прямо в HTML (id="pageFaq")
+//  toggleFaq принимает строковый id элемента
+// ══════════════════════════════
+function initFaq(){
+  // Ничего не делаем — вопросы уже в HTML
+}
+function toggleFaq(id){
+  const el=document.getElementById(id);
+  if(!el)return;
+  const ans=el.querySelector('.faq-a');
+  const isOpen=el.classList.contains('open');
+  if(isOpen){
+    ans.style.maxHeight=ans.scrollHeight+'px';
+    requestAnimationFrame(()=>{ans.style.maxHeight='0';});
+    el.classList.remove('open');
+  } else {
+    el.classList.add('open');
+    ans.style.maxHeight=ans.scrollHeight+'px';
+    ans.addEventListener('transitionend',()=>{if(el.classList.contains('open'))ans.style.maxHeight='none';},{once:true});
+  }
+}
+
+</script>
+</body>
+</html>
